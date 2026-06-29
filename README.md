@@ -38,6 +38,44 @@ so any deposit size works.
 It treats *any* idle cash the same way, so dividends get reinvested into the
 laggards too, not just fresh deposits.
 
+## Project files
+
+The code is split so each file has a single job. Data flows
+`bot.py → rebalancer.py → broker.py`, and all of them read settings from
+`config.py`. The dashboard stands apart and never trades.
+
+- **`config.py`** — the settings file, and the only one you'll normally edit.
+  Holds the 10 tickers and their 10% targets, the paper-vs-live switch, the
+  dollar thresholds (minimum cash before acting, the $1 order floor, cash to
+  leave untouched), and the dashboard port. It also loads your `key.txt` and
+  `secret.txt` from `private/`. Nothing here trades — it's just the knobs and
+  the credentials loader.
+
+- **`broker.py`** — the translator between the bot and Alpaca. Every actual
+  Alpaca call lives here: read the account balance, list positions, check
+  whether the market is open, look for pending orders, and submit a buy. It
+  converts Alpaca's text responses into clean numbers for the rest of the bot.
+  If Alpaca changes its API, this is the only file that should need touching.
+
+- **`rebalancer.py`** — the brain, where the strategy lives. Contains the math
+  that decides how to split your cash (the formula above), executes the buys
+  through `broker.py`, and writes the activity log. The core calculation is a
+  pure function with no Alpaca dependency, which makes it easy to test in
+  isolation.
+
+- **`bot.py`** — the thing you actually run. Wires the other three together and
+  provides the command-line options (`--dry-run`, `--status`, `--watch`, or no
+  flag to invest once and quit). It also holds the live-trading confirmation
+  guard. Think of it as the front door.
+
+- **`dashboard.py`** — completely separate from trading. A small local web
+  server that reads your account and positions and renders the page with the
+  balance meters. It is **read-only** and never places an order. Run it
+  alongside the bot or on its own.
+
+The two non-`.py` files are **`requirements.txt`** (libraries to install) and
+this **`README.md`**.
+
 ## Setup
 
 1. Put this folder on your Desktop as `mystic-bot` (you've already got
