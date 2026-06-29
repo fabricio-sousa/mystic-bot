@@ -1,2 +1,4 @@
 private/
 __pycache__
+logs/activity.csv
+logs/runs.log
