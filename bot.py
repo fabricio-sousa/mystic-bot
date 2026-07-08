@@ -51,6 +51,26 @@ USE_RSI_FILTER = True          # Set False to disable and trade all 96c prints.
 RSI_MIN = 55                   # Skip entries where RSI-14 is below this threshold.
 RSI_CANDLES = 20               # 1-min candles to fetch for RSI calculation (need >= 15).
 
+# --- FOMC skip ---
+# FOMC decision days (rate announcement at 2:00 PM ET) produced 83-91% win rates
+# vs the 96.27% breakeven — the only macro release type that hurt RSI-filtered entries.
+# CPI, PPI, and NFP days all hit 100% (RSI filter already handled those).
+# Skipping FOMC days improves ROI from +71.7% to +82.8% and cuts max DD from $900
+# to $768 on the 3-month backtest. Add the FOMC decision date (the second day of
+# each two-day meeting) in YYYY-MM-DD format. Update this list each year.
+SKIP_FOMC_DAYS = True
+FOMC_DECISION_DATES = {
+    # 2026 — source: federalreserve.gov/monetarypolicy/fomccalendars.htm
+    "2026-01-28",
+    "2026-03-18",
+    "2026-04-29",   # backtested — 83.3% win rate (2 losses on 12 trades)
+    "2026-06-17",   # backtested — 90.9% win rate (1 loss on 11 trades)
+    "2026-07-29",
+    "2026-09-16",
+    "2026-10-28",
+    "2026-12-09",
+}
+
 # --- Two-stage stop ---
 # DISABLED BY DEFAULT. The 80/75c fixed-cent threshold is meaningless for the
 # 96c-favorite strategy: positions are already deep ITM at entry so the stop
@@ -102,6 +122,16 @@ def in_trading_window(now=None):
 
     # Saturday: closed
     return False
+
+def is_fomc_day(now=None):
+    """Return True if today is a configured FOMC decision date and SKIP_FOMC_DAYS
+    is enabled. FOMC announcements at 2:00 PM ET inject directional uncertainty
+    that RSI cannot anticipate — backtesting showed 83–91% win rates on these days
+    vs 99%+ on all other days."""
+    if not SKIP_FOMC_DAYS:
+        return False
+    now = now or datetime.now(pytz.timezone("US/Eastern"))
+    return now.strftime("%Y-%m-%d") in FOMC_DECISION_DATES
 
 # ====================== HELPERS ======================
 def log(msg: str):
@@ -342,7 +372,8 @@ if __name__ == "__main__":
     mode = "PAPER/SHADOW" if PAPER_MODE else "LIVE"
     stop_txt = f"stop {STOP_ARM_PRICE}->{STOP_TRIGGER_PRICE}c" if USE_STOP else "stop OFF (hold-to-settle)"
     rsi_txt  = f"RSI≥{RSI_MIN}" if USE_RSI_FILTER else "RSI filter OFF"
-    log(f"🪄 Magick Bot v6.0.0 Active [{mode}] | {stop_txt} | schedule A (drop 17-22 ET) | {rsi_txt}")
+    fomc_txt = "skip FOMC days" if SKIP_FOMC_DAYS else "FOMC skip OFF"
+    log(f"🪄 Magick Bot v6.0.0 Active [{mode}] | {stop_txt} | schedule A (drop 17-22 ET) | {rsi_txt} | {fomc_txt}")
 
     while True:
         try:
@@ -491,6 +522,11 @@ if __name__ == "__main__":
                             ask_price = n_ask
                         if side is None:
                             time.sleep(3); continue
+
+                        # FOMC skip — bail immediately, no API call needed.
+                        if is_fomc_day(now_et):
+                            log(f"⛔ FOMC day: skipping {market.ticker} {side.upper()} entry")
+                            time.sleep(10); continue
 
                         # RSI filter — skip entries below RSI_MIN (default 55).
                         # Backtesting showed sub-55 RSI entries won only ~12% of the
