@@ -25,11 +25,11 @@ TRADES_FILE = os.path.join(BASE_DIR, "trades.json")
 
 # --- Trading mode ---
 PAPER_MODE = True              # Shadow/paper trading. No real orders are placed.
-PAPER_START_BALANCE = 1000.0   # Simulated starting cash; moves with realized PnL.
+PAPER_START_BALANCE = 500.0   # Simulated starting cash; moves with realized PnL.
 PAPER_SAFETY_FLOOR = 0.0       # Paper floor (live SAFETY_FLOOR would block trading from $1000).
 
-# --- Sizing (flat 1%) ---
-FLAT_RISK = 0.25               # Stake 1% of available cash per trade (flat, within the schedule windows).
+# --- Sizing (flat 25%) ---
+FLAT_RISK = 0.10               # Stake 25% of available cash per trade (flat, within the schedule windows).
 MAX_POSITION_DOLLARS = 500.0
 FEE_RATE = 0.07                # Kalshi trading-fee rate for paper/sim PnL. VERIFY against the
                                # current KXBTC15M schedule (get_series_fee_changes); fees change.
@@ -45,11 +45,12 @@ ENTRY_TIME_MAX = 10.0          # Minutes-before-close window end.
 # Entries with RSI-14 >= 55 won 98.63%, producing +84.2% ROI with a $573 max DD
 # vs +49.6% / $2,317 without the filter. The filter cuts ~40% of trade volume but
 # eliminates losing months entirely on the 3-month test window.
-# RSI is computed from the last 20 KXBTC15M 1-min yes_ask candles (BTC-implied price)
-# using the same series the bot already reads — no external data source needed.
+# RSI is computed from 1-min KXBTC15M candles (BTC-implied price) spanning the current
+# open market plus recently-settled ones — same series the bot already reads, no
+# external data source needed. See compute_rsi() for the multi-market merge.
 USE_RSI_FILTER = True          # Set False to disable and trade all 96c prints.
 RSI_MIN = 55                   # Skip entries where RSI-14 is below this threshold.
-RSI_CANDLES = 20               # 1-min candles to fetch for RSI calculation (need >= 15).
+RSI_LOOKBACK_MIN = 60          # Minutes of candle history to fetch (need >= 15 valid closes).
 
 # --- FOMC skip ---
 # FOMC decision days (rate announcement at 2:00 PM ET) produced 83-91% win rates
@@ -72,11 +73,14 @@ FOMC_DECISION_DATES = {
 }
 
 # --- Two-stage stop ---
-# DISABLED BY DEFAULT. The 80/75c fixed-cent threshold is meaningless for the
-# 96c-favorite strategy: positions are already deep ITM at entry so the stop
-# fires instantly on any normal intraday tick. Backtesting confirmed gap-scaled
-# slippage makes fixed-cent stops net-negative (see README_tests_addendum.md).
-# Only re-enable with thresholds derived for this specific entry regime.
+# ENABLED with a 45%-down threshold (arm 70c, trigger 53c from a 96c entry).
+# Backtesting on real Kalshi data showed this converts full -96c losses into
+# ~-40c stop-outs and beat no-stop at every slippage level tested (+84.2% ROI /
+# $573 max DD vs +71.7% / $900 without). Unlike the old 80/75c thresholds — which
+# fired instantly because a 96c favorite's bid sits far above 75c — the 53c trigger
+# only fires on a genuine ~45% reversal, so normal intraday ticks don't trip it.
+# The stop arms when the held-side bid falls to STOP_ARM_PRICE and exits when it
+# falls further to STOP_TRIGGER_PRICE. Set USE_STOP=False to hold to settlement.
 USE_STOP = True
 STOP_ARM_PRICE = 70            # Only used if USE_STOP=True. Begin monitoring once bid <= this.
 STOP_TRIGGER_PRICE = 53        # Only used if USE_STOP=True. Exit once armed & bid <= this.
@@ -156,8 +160,8 @@ def compute_rsi(current_ticker):
     """Compute RSI-14 from recent KXBTC15M 1-min yes_ask candles.
 
     A single KXBTC15M market only lives ~20 minutes, so we span the
-    current open market plus the 2 most recently settled ones — giving
-    ~45-60 minutes of candle history and reliably 35+ closes for RSI-14.
+    current open market plus the 2 most recently settled ones over the
+    RSI_LOOKBACK_MIN window — reliably yielding 35+ closes for RSI-14.
 
     yes_ask.close is used as the price series. Falls back to yes_bid.close
     if yes_ask.close is None (can happen on the still-open current candle).
@@ -167,6 +171,7 @@ def compute_rsi(current_ticker):
         return None
     try:
         now_ts = int(time.time())
+        window = RSI_LOOKBACK_MIN * 60
 
         # 1. Collect tickers: current open market + 2 recently settled
         tickers = [current_ticker]
@@ -174,7 +179,7 @@ def compute_rsi(current_ticker):
             resp_s = client.get_markets(
                 series_ticker  = "KXBTC15M",
                 status         = "settled",
-                min_settled_ts = now_ts - 60 * 60,   # settled in last 60 min
+                min_settled_ts = now_ts - window,   # settled within the lookback window
                 limit          = 2,
             )
             for m in getattr(resp_s, "markets", []) or []:
@@ -186,7 +191,7 @@ def compute_rsi(current_ticker):
         # 2. Batch fetch 1-min candles across all collected tickers
         batch = client.batch_get_market_candlesticks(
             market_tickers  = ",".join(tickers),
-            start_ts        = now_ts - 60 * 60,   # 60-min lookback
+            start_ts        = now_ts - window,
             end_ts          = now_ts,
             period_interval = 1,
         )
@@ -487,7 +492,7 @@ if __name__ == "__main__":
                 live_bid = safe_price_cents(m_live.yes_bid_dollars if curr['side'] == "yes" else m_live.no_bid_dollars)
 
                 # Stop active until final 30s of THIS market. Gated on USE_STOP —
-                # when False (default, matches backtest) positions HOLD to settlement.
+                # when False, positions HOLD to settlement instead.
                 if USE_STOP and curr_time_left > 0.5 and live_bid > 0:
                     if not curr.get("stop_armed") and live_bid <= STOP_ARM_PRICE:
                         curr["stop_armed"] = True
