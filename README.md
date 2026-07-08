@@ -1,4 +1,4 @@
-# Magick Bot
+# Mystic Bot
 
 A Python bot that trades 15-minute Bitcoin price-direction contracts on [Kalshi](https://kalshi.com). It watches the `KXBTC15M` series and enters a position whenever either side's ask hits exactly 96¢ — buying a deep favorite and holding to settlement.
 
