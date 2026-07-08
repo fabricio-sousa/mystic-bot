@@ -196,21 +196,31 @@ def compute_rsi(current_ticker):
             period_interval = 1,
         )
 
-        # 3. Merge, using yes_ask.close with yes_bid.close as fallback
+        # 3. Merge, using yes_ask close with yes_bid close as fallback.
+        # Kalshi migrated live candlestick OHLC to *_dollars string fields
+        # (e.g. "0.5600"); older SDK builds exposed a bare `close` in cents.
+        # Read close_dollars first, fall back to close, so this works either way.
+        def _close(side_obj):
+            if side_obj is None:
+                return None
+            v = getattr(side_obj, "close_dollars", None)
+            if v is None:
+                v = getattr(side_obj, "close", None)
+            return v
+
+        mkts = getattr(batch, "markets", []) or []
+        raw = 0                                   # total candle rows returned
         all_candles = []
-        for mkt in getattr(batch, "markets", []) or []:
-            for c in getattr(mkt, "candlesticks", []) or []:
+        for mkt in mkts:
+            cs = getattr(mkt, "candlesticks", []) or []
+            raw += len(cs)
+            for c in cs:
                 ts = getattr(c, "end_period_ts", None)
                 if ts is None:
                     continue
-                v = None
-                ya = getattr(c, "yes_ask", None)
-                if ya is not None:
-                    v = getattr(ya, "close", None)
+                v = _close(getattr(c, "yes_ask", None))
                 if v is None:                        # fallback: yes_bid
-                    yb = getattr(c, "yes_bid", None)
-                    if yb is not None:
-                        v = getattr(yb, "close", None)
+                    v = _close(getattr(c, "yes_bid", None))
                 if v is not None:
                     all_candles.append((ts, float(v)))
 
@@ -222,8 +232,8 @@ def compute_rsi(current_ticker):
                 seen.add(ts); closes.append(v)
 
         if len(closes) < 15:
-            log(f"⚠️ RSI: only {len(closes)} candles across {len(tickers)} markets "
-                f"— skipping filter (need 15+)")
+            log(f"⚠️ RSI: {len(closes)} usable / {raw} raw candles across "
+                f"{len(mkts)}/{len(tickers)} markets — skipping (need 15+)")
             return None
 
         # 5. Wilder RSI-14 via simple-average seed
