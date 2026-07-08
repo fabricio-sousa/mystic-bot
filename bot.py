@@ -25,11 +25,11 @@ TRADES_FILE = os.path.join(BASE_DIR, "trades.json")
 
 # --- Trading mode ---
 PAPER_MODE = True              # Shadow/paper trading. No real orders are placed.
-PAPER_START_BALANCE = 500.0   # Simulated starting cash; moves with realized PnL.
+PAPER_START_BALANCE = 1000.0   # Simulated starting cash; moves with realized PnL.
 PAPER_SAFETY_FLOOR = 0.0       # Paper floor (live SAFETY_FLOOR would block trading from $1000).
 
 # --- Sizing (flat 1%) ---
-FLAT_RISK = 0.10               # Stake 1% of available cash per trade (flat, within the schedule windows).
+FLAT_RISK = 0.25               # Stake 1% of available cash per trade (flat, within the schedule windows).
 MAX_POSITION_DOLLARS = 500.0
 FEE_RATE = 0.07                # Kalshi trading-fee rate for paper/sim PnL. VERIFY against the
                                # current KXBTC15M schedule (get_series_fee_changes); fees change.
@@ -166,7 +166,7 @@ def compute_rsi(ticker):
         log(f"⚠️ RSI fetch error: {e} — skipping entry")
         return None
 
-
+def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             try: return json.load(f)
