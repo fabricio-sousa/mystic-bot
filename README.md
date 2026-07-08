@@ -10,7 +10,7 @@ A Python bot that trades 15-minute Bitcoin price-direction contracts on [Kalshi]
 
 Each `KXBTC15M` market is a binary question: will BTC be higher or lower in 15 minutes than it is right now? The contract pays $1.00 if correct, $0.00 if not.
 
-The bot's entry rule: if the YES ask or NO ask is exactly 96¢, and RSI-14 is at or above 55, buy that side. At 96¢ entry, breakeven is 96.27% wins (accounting for fees). Backtesting on real Kalshi candlestick data (Apr–Jun 2026, 584 RSI-filtered trades on Schedule A) showed a 98.63% realized win rate — well above breakeven, with every month profitable.
+The bot's entry rule: if the YES ask or NO ask is exactly 96¢, RSI-14 is at or above 55, and today is not an FOMC decision day, buy that side. At 96¢ entry, breakeven is 96.27% wins (accounting for fees). Backtesting on real Kalshi candlestick data (Apr–Jun 2026, 561 trades after all filters) showed a 99.11% realized win rate — well above breakeven, with every month profitable.
 
 The payoff is asymmetric: win +$0.04/contract, lose −$0.96/contract. A single loss erases ~24 wins, so loss clustering is the dominant risk even at a high win rate.
 
@@ -21,6 +21,7 @@ The payoff is asymmetric: win +$0.04/contract, lose −$0.96/contract. A single 
 ```
 Every 15-minute KXBTC15M market, 1–10 minutes before close:
   if yes_ask == 96¢ or no_ask == 96¢:
+    if today is an FOMC decision day  →  skip (rate announcement vol)
     compute RSI-14 from the last 20 one-minute KXBTC15M candles
     if RSI-14 < 55  →  skip (sub-threshold momentum)
     else            →  buy that side at 96¢
@@ -45,6 +46,25 @@ RSI is computed from the last 20 one-minute `yes_ask` closes of the KXBTC15M ser
 | ≥ 55 (entered) | 584 | 98.63% | +2.36pp |
 
 To disable the filter and trade all 96¢ prints: set `USE_RSI_FILTER = False`.
+
+---
+
+## FOMC skip
+
+Analysis of 7 macro release days in the Apr–Jun 2026 window found that CPI, PPI, and NFP days were unaffected — RSI-filtered entries on those days hit 100% win rates. FOMC decision days were the exception: the April 29 and June 17 announcements produced 83.3% and 90.9% win rates respectively, both well below the 96.27% breakeven.
+
+The likely cause: FOMC rate decisions at 2:00 PM ET can reverse BTC's short-term trend entirely within minutes. RSI captures momentum direction going into the announcement but cannot anticipate the announcement itself, so the signal loses its predictive value for the rest of that day.
+
+Skipping the two FOMC days (23 trades) improved ROI from +71.7% to +82.8% and trimmed max DD from $900 to $768.
+
+| Date filtered | Event | Trades skipped | Win rate on that day |
+|---|---|--:|--:|
+| 2026-04-29 | FOMC decision (Apr 28–29) | 12 | 83.3% |
+| 2026-06-17 | FOMC decision (Jun 16–17) | 11 | 90.9% |
+
+The `FOMC_DECISION_DATES` set in config holds the decision date (always the second day of each two-day meeting) for the full calendar year. Update it each January when the Fed publishes the following year's schedule at `federalreserve.gov/monetarypolicy/fomccalendars.htm`.
+
+To disable: set `SKIP_FOMC_DAYS = False`.
 
 ---
 
@@ -85,11 +105,11 @@ All results on real Kalshi KXBTC15M candlestick data, Apr–Jun 2026, starting b
 | Configuration | Trades | Win rate | ROI | Max DD | All months green |
 |---|--:|--:|--:|--:|:---:|
 | Schedule A, no filter, no stop | 1,435 | 96.93% | +49.6% | $2,317 | No |
-| Schedule A, no filter, stop 45% | 1,435 | 96.93% | +118.2% | $1,098 | No |
-| **Schedule A, RSI ≥ 55, no stop** | **584** | **98.63%** | **+71.7%** | **$900** | **Yes** |
-| **Schedule A, RSI ≥ 55, stop 45%** | **584** | **98.63%** | **+84.2%** | **$573** | **Yes** |
+| Schedule A, RSI ≥ 55, no stop | 584 | 98.63% | +71.7% | $900 | Yes |
+| Schedule A, RSI ≥ 55, stop 45% | 584 | 98.63% | +84.2% | $573 | Yes |
+| **Schedule A, RSI ≥ 55, skip FOMC, no stop** | **561** | **99.11%** | **+82.8%** | **$768** | **Yes** |
 
-The RSI filter and stop together produced the strongest risk-adjusted result: +84.2% ROI with a $573 max drawdown and no losing months across the 3-month window.
+Each filter adds independently: Schedule A removes the bad post-market hours, RSI ≥ 55 removes low-momentum entries, and the FOMC skip removes the two days where macro vol overwhelmed the RSI signal. The current default config (RSI filter on, FOMC skip on, stop off) is the bolded row.
 
 These results are in-sample on 3 months of data. Treat them as directionally encouraging, not a performance guarantee.
 
@@ -142,6 +162,8 @@ All knobs are at the top of `bot.py`.
 | `USE_RSI_FILTER` | `True` | Enable the RSI-14 entry gate |
 | `RSI_MIN` | `55` | Minimum RSI-14 required to enter |
 | `RSI_CANDLES` | `20` | One-minute candles fetched to compute RSI (need ≥ 15) |
+| `SKIP_FOMC_DAYS` | `True` | Skip entries on FOMC decision days |
+| `FOMC_DECISION_DATES` | 2026 calendar | Set of `YYYY-MM-DD` strings — update each January |
 | `USE_STOP` | `False` | Enable the two-stage stop-loss |
 | `STOP_ARM_PRICE` | `80` | Held-side bid level that arms the stop |
 | `STOP_TRIGGER_PRICE` | `75` | Held-side bid level that fires the exit |
@@ -218,6 +240,7 @@ BOT_DIR=/path/to/your/bot python dashboard.py
 
 - **Paper mode** — default on; no real orders until you flip the flag
 - **RSI gate** — skips entries with RSI-14 below 55; logs every skip so you can verify it in paper mode before going live
+- **FOMC skip** — skips all entries on Fed decision days; logs each skip; update `FOMC_DECISION_DATES` each January
 - **Cash floor** — live mode halts if balance drops below `SAFETY_FLOOR`
 - **Consecutive-loss circuit breaker** — halts after 8 losses in a row (live mode); disabled in paper so collection runs don't get cut short
 - **Unfilled order cleanup** — any unmatched remainder is canceled immediately after the fill-poll window; no resting orders are left in the book
@@ -253,6 +276,7 @@ python run_real_backtest.py
 ## Known limitations
 
 - **3 months of real data.** The edge appears real but the sample is small. A minimum of 6 months / ~4,000 trades is a reasonable bar before drawing firm conclusions.
+- **FOMC dates need annual maintenance.** The `FOMC_DECISION_DATES` set must be updated each January. Missing a date means the bot trades through a known risk event; an outdated date means a normal trading day gets skipped. Source: `federalreserve.gov/monetarypolicy/fomccalendars.htm`.
 - **RSI filter is regime-dependent.** The filter was derived during a bear market (Apr–Jun 2026, BTC −14%). In a bull market the NO-side entries would likely perform differently. Monitor the skip log in paper mode and revisit the threshold on fresh data.
 - **Paper fills are optimistic.** Paper mode assumes you always get the ask. Real books don't always give that, especially on fast 96¢ prints. Running live at minimum size ($50–100 notional cap) is the most informative thing you can do while accumulating data.
 - **Stop-loss fills gap.** When a 96¢ favorite reverses hard, the bid doesn't glide to the trigger — it gaps through it. Average realized fill on a stop-out in backtesting was ~44¢, not the trigger price. Account for this when sizing stop thresholds.
