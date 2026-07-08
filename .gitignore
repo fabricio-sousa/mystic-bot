@@ -3,3 +3,5 @@ __pycache__/kalshi_btc15m_tests.cpython-314.pyc
 apikey.txt
 private.txt
 log.txt
+state.json
+trades.json
