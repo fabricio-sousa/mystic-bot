@@ -25,7 +25,7 @@ TRADES_FILE = os.path.join(BASE_DIR, "trades.json")
 
 # --- Trading mode ---
 PAPER_MODE = True              # Shadow/paper trading. No real orders are placed.
-PAPER_START_BALANCE = 500.0   # Simulated starting cash; moves with realized PnL.
+PAPER_START_BALANCE = 1000.0   # Simulated starting cash; moves with realized PnL.
 PAPER_SAFETY_FLOOR = 0.0       # Paper floor (live SAFETY_FLOOR would block trading from $1000).
 
 # --- Sizing (flat 1%) ---
@@ -152,35 +152,53 @@ def compute_fee_cents(price_cents, count):
     p = max(0.0, min(1.0, (price_cents or 0) / 100.0))
     return math.ceil(FEE_RATE * count * p * (1.0 - p) * 100.0)
 
-def compute_rsi(ticker):
-    """Fetch the last RSI_CANDLES 1-min yes_ask candles for `ticker`'s series and
-    return RSI-14 (Wilder's smoothing via simple average of first period).
-    Returns None if insufficient data or the API call fails — caller treats None
-    as 'filter not applicable' and skips the entry to be safe."""
+def compute_rsi(current_ticker):
+    """Compute RSI-14 from recent KXBTC15M 1-min yes_ask candles.
+
+    A single KXBTC15M market only lives ~20 minutes, so fetching candles
+    for one ticker rarely yields the 15+ closes needed for RSI. Instead we
+    fetch the last 3 open/recent markets via batch_get_market_candlesticks,
+    merge their candles chronologically, and compute RSI on the combined
+    series — giving ~40-45 minutes of price history with no gaps.
+
+    Returns None if the API call fails or there aren't enough candles;
+    caller skips the entry to be safe."""
     if not USE_RSI_FILTER:
-        return None  # filter disabled; caller ignores the return value
+        return None
     try:
-        now_ts  = int(time.time())
-        resp    = client.get_market_candlesticks(
-            series_ticker   = "KXBTC15M",
-            ticker          = ticker,
-            start_ts        = now_ts - RSI_CANDLES * 60 - 60,
+        now_ts = int(time.time())
+        # Fetch the 3 most recent KXBTC15M markets (open + just-settled)
+        resp_m = client.get_markets(series_ticker="KXBTC15M", limit=3, status="open")
+        tickers = [m.ticker for m in getattr(resp_m, "markets", []) or []]
+        if not tickers:
+            log("⚠️ RSI: no open markets found — skipping filter")
+            return None
+        # Batch fetch candles spanning the last RSI_CANDLES minutes + buffer
+        batch = client.batch_get_market_candlesticks(
+            market_tickers  = ",".join(tickers),
+            start_ts        = now_ts - RSI_CANDLES * 60 - 120,
             end_ts          = now_ts,
             period_interval = 1,
         )
-        candles = getattr(resp, "candlesticks", None) or []
-        # yes_ask.close is already in cents (StrictInt per the BidAskDistribution model).
-        closes = []
-        for c in candles:
-            ya = getattr(c, "yes_ask", None)
-            v  = getattr(ya, "close", None) if ya else None
-            if v is not None:
-                try: closes.append(float(v))   # already cents — no conversion needed
-                except (TypeError, ValueError): pass
+        # Merge candles from all markets, sort by end_period_ts, deduplicate
+        all_candles = []
+        for mkt in getattr(batch, "markets", []) or []:
+            for c in getattr(mkt, "candlesticks", []) or []:
+                ya = getattr(c, "yes_ask", None)
+                v  = getattr(ya, "close", None) if ya else None
+                ts = getattr(c, "end_period_ts", None)
+                if v is not None and ts is not None:
+                    all_candles.append((ts, float(v)))
+        all_candles.sort(key=lambda x: x[0])
+        # Deduplicate by timestamp (markets can overlap at boundaries)
+        seen, closes = set(), []
+        for ts, v in all_candles:
+            if ts not in seen:
+                seen.add(ts); closes.append(v)
         if len(closes) < 15:
-            log(f"⚠️ RSI: only {len(closes)} candles — skipping filter (need 15+)")
+            log(f"⚠️ RSI: only {len(closes)} candles across {len(tickers)} markets — skipping filter (need 15+)")
             return None
-        # Wilder RSI-14 via simple-average seed.
+        # Wilder RSI-14 via simple-average seed
         period = 14
         gains  = [max(0.0, closes[i] - closes[i-1]) for i in range(1, len(closes))]
         losses = [max(0.0, closes[i-1] - closes[i]) for i in range(1, len(closes))]
