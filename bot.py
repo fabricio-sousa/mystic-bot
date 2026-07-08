@@ -25,11 +25,11 @@ TRADES_FILE = os.path.join(BASE_DIR, "trades.json")
 
 # --- Trading mode ---
 PAPER_MODE = True              # Shadow/paper trading. No real orders are placed.
-PAPER_START_BALANCE = 1000.0   # Simulated starting cash; moves with realized PnL.
+PAPER_START_BALANCE = 500.0   # Simulated starting cash; moves with realized PnL.
 PAPER_SAFETY_FLOOR = 0.0       # Paper floor (live SAFETY_FLOOR would block trading from $1000).
 
 # --- Sizing (flat 1%) ---
-FLAT_RISK = 0.25               # Stake 1% of available cash per trade (flat, within the schedule windows).
+FLAT_RISK = 0.10               # Stake 1% of available cash per trade (flat, within the schedule windows).
 MAX_POSITION_DOLLARS = 500.0
 FEE_RATE = 0.07                # Kalshi trading-fee rate for paper/sim PnL. VERIFY against the
                                # current KXBTC15M schedule (get_series_fee_changes); fees change.
@@ -77,9 +77,9 @@ FOMC_DECISION_DATES = {
 # fires instantly on any normal intraday tick. Backtesting confirmed gap-scaled
 # slippage makes fixed-cent stops net-negative (see README_tests_addendum.md).
 # Only re-enable with thresholds derived for this specific entry regime.
-USE_STOP = False
-STOP_ARM_PRICE = 80            # Only used if USE_STOP=True. Begin monitoring once bid <= this.
-STOP_TRIGGER_PRICE = 75        # Only used if USE_STOP=True. Exit once armed & bid <= this.
+USE_STOP = True
+STOP_ARM_PRICE = 70            # Only used if USE_STOP=True. Begin monitoring once bid <= this.
+STOP_TRIGGER_PRICE = 53        # Only used if USE_STOP=True. Exit once armed & bid <= this.
 
 # --- Risk rails ---
 SAFETY_FLOOR = 1000.0          # Live-mode cash floor.
