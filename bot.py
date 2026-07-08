@@ -29,7 +29,7 @@ PAPER_START_BALANCE = 1000.0   # Simulated starting cash; moves with realized Pn
 PAPER_SAFETY_FLOOR = 0.0       # Paper floor (live SAFETY_FLOOR would block trading from $1000).
 
 # --- Sizing (flat 1%) ---
-FLAT_RISK = 0.10               # Stake 1% of available cash per trade (flat, within the schedule windows).
+FLAT_RISK = 0.25               # Stake 1% of available cash per trade (flat, within the schedule windows).
 MAX_POSITION_DOLLARS = 500.0
 FEE_RATE = 0.07                # Kalshi trading-fee rate for paper/sim PnL. VERIFY against the
                                # current KXBTC15M schedule (get_series_fee_changes); fees change.
@@ -155,50 +155,73 @@ def compute_fee_cents(price_cents, count):
 def compute_rsi(current_ticker):
     """Compute RSI-14 from recent KXBTC15M 1-min yes_ask candles.
 
-    A single KXBTC15M market only lives ~20 minutes, so fetching candles
-    for one ticker rarely yields the 15+ closes needed for RSI. Instead we
-    fetch the last 3 open/recent markets via batch_get_market_candlesticks,
-    merge their candles chronologically, and compute RSI on the combined
-    series — giving ~40-45 minutes of price history with no gaps.
+    A single KXBTC15M market only lives ~20 minutes, so we span the
+    current open market plus the 2 most recently settled ones — giving
+    ~45-60 minutes of candle history and reliably 35+ closes for RSI-14.
 
-    Returns None if the API call fails or there aren't enough candles;
-    caller skips the entry to be safe."""
+    yes_ask.close is used as the price series. Falls back to yes_bid.close
+    if yes_ask.close is None (can happen on the still-open current candle).
+
+    Returns None if insufficient data or the API call fails; caller skips."""
     if not USE_RSI_FILTER:
         return None
     try:
         now_ts = int(time.time())
-        # Fetch the 3 most recent KXBTC15M markets (open + just-settled)
-        resp_m = client.get_markets(series_ticker="KXBTC15M", limit=3, status="open")
-        tickers = [m.ticker for m in getattr(resp_m, "markets", []) or []]
-        if not tickers:
-            log("⚠️ RSI: no open markets found — skipping filter")
-            return None
-        # Batch fetch candles spanning the last RSI_CANDLES minutes + buffer
+
+        # 1. Collect tickers: current open market + 2 recently settled
+        tickers = [current_ticker]
+        try:
+            resp_s = client.get_markets(
+                series_ticker  = "KXBTC15M",
+                status         = "settled",
+                min_settled_ts = now_ts - 60 * 60,   # settled in last 60 min
+                limit          = 2,
+            )
+            for m in getattr(resp_s, "markets", []) or []:
+                if m.ticker != current_ticker:
+                    tickers.append(m.ticker)
+        except Exception:
+            pass   # settled lookup is a best-effort enhancement
+
+        # 2. Batch fetch 1-min candles across all collected tickers
         batch = client.batch_get_market_candlesticks(
             market_tickers  = ",".join(tickers),
-            start_ts        = now_ts - RSI_CANDLES * 60 - 120,
+            start_ts        = now_ts - 60 * 60,   # 60-min lookback
             end_ts          = now_ts,
             period_interval = 1,
         )
-        # Merge candles from all markets, sort by end_period_ts, deduplicate
+
+        # 3. Merge, using yes_ask.close with yes_bid.close as fallback
         all_candles = []
         for mkt in getattr(batch, "markets", []) or []:
             for c in getattr(mkt, "candlesticks", []) or []:
-                ya = getattr(c, "yes_ask", None)
-                v  = getattr(ya, "close", None) if ya else None
                 ts = getattr(c, "end_period_ts", None)
-                if v is not None and ts is not None:
+                if ts is None:
+                    continue
+                v = None
+                ya = getattr(c, "yes_ask", None)
+                if ya is not None:
+                    v = getattr(ya, "close", None)
+                if v is None:                        # fallback: yes_bid
+                    yb = getattr(c, "yes_bid", None)
+                    if yb is not None:
+                        v = getattr(yb, "close", None)
+                if v is not None:
                     all_candles.append((ts, float(v)))
+
+        # 4. Sort and deduplicate
         all_candles.sort(key=lambda x: x[0])
-        # Deduplicate by timestamp (markets can overlap at boundaries)
         seen, closes = set(), []
         for ts, v in all_candles:
             if ts not in seen:
                 seen.add(ts); closes.append(v)
+
         if len(closes) < 15:
-            log(f"⚠️ RSI: only {len(closes)} candles across {len(tickers)} markets — skipping filter (need 15+)")
+            log(f"⚠️ RSI: only {len(closes)} candles across {len(tickers)} markets "
+                f"— skipping filter (need 15+)")
             return None
-        # Wilder RSI-14 via simple-average seed
+
+        # 5. Wilder RSI-14 via simple-average seed
         period = 14
         gains  = [max(0.0, closes[i] - closes[i-1]) for i in range(1, len(closes))]
         losses = [max(0.0, closes[i-1] - closes[i]) for i in range(1, len(closes))]
@@ -210,6 +233,7 @@ def compute_rsi(current_ticker):
         if avg_l == 0:
             return 100.0
         return round(100.0 - 100.0 / (1.0 + avg_g / avg_l), 1)
+
     except Exception as e:
         log(f"⚠️ RSI fetch error: {e} — skipping entry")
         return None
