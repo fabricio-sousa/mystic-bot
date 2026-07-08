@@ -161,21 +161,21 @@ def compute_rsi(ticker):
         return None  # filter disabled; caller ignores the return value
     try:
         now_ts  = int(time.time())
-        resp    = client.get_series_market_candlesticks(
-            series_ticker = "KXBTC15M",
-            ticker        = ticker,
-            start_ts      = now_ts - RSI_CANDLES * 60 - 60,
-            end_ts        = now_ts,
+        resp    = client.get_market_candlesticks(
+            series_ticker   = "KXBTC15M",
+            ticker          = ticker,
+            start_ts        = now_ts - RSI_CANDLES * 60 - 60,
+            end_ts          = now_ts,
             period_interval = 1,
         )
         candles = getattr(resp, "candlesticks", None) or []
-        # Use yes_ask close as the BTC-implied price series.
-        closes  = []
+        # yes_ask.close is already in cents (StrictInt per the BidAskDistribution model).
+        closes = []
         for c in candles:
             ya = getattr(c, "yes_ask", None)
             v  = getattr(ya, "close", None) if ya else None
             if v is not None:
-                try: closes.append(float(v) * 100)  # dollars -> cents
+                try: closes.append(float(v))   # already cents — no conversion needed
                 except (TypeError, ValueError): pass
         if len(closes) < 15:
             log(f"⚠️ RSI: only {len(closes)} candles — skipping filter (need 15+)")
