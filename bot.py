@@ -7,6 +7,29 @@ from datetime import datetime
 import pytz
 from kalshi_python_sync import Configuration, KalshiClient
 
+# ---------------------------------------------------------------------------
+# SDK resilience patch: tolerate null booleans in the Market model.
+# During Kalshi API partial outages, the /markets endpoint can return null
+# for fields the SDK types as a strict bool (e.g. fractional_trading_enabled,
+# can_close_early), which makes Pydantic raise a validation error and kills
+# the loop. We relax every strict-bool field on the Market model to
+# Optional[bool] (default None) so a missing/null flag is parsed as None
+# instead of crashing. This only affects local parsing — it never changes
+# what we send to Kalshi — and is a no-op once the API returns proper bools.
+try:
+    from typing import Optional as _Optional
+    from kalshi_python_sync.models.market import Market as _Market
+    _patched_bool_fields = 0
+    for _name, _fi in list(_Market.model_fields.items()):
+        if _fi.annotation is bool or str(_fi.annotation) == "bool":
+            _fi.annotation = _Optional[bool]
+            _fi.default = None
+            _patched_bool_fields += 1
+    if _patched_bool_fields:
+        _Market.model_rebuild(force=True)
+except Exception as _patch_err:  # never let the patch itself break startup
+    print(f"[warn] Market bool-tolerance patch skipped: {_patch_err}")
+
 # Windows-only tools
 try:
     import winsound
