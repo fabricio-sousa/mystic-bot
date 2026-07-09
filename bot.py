@@ -102,6 +102,7 @@ STRIKE_LIMIT = None if PAPER_MODE else STRIKE_LIMIT_LIVE
 FILL_POLL_TRIES = 4            # Seconds to wait for a marketable limit order before canceling remainder.
 
 OVERRIDE_TRIGGERED = False
+_last_skip_logged_ticker = None  # Tracks last ticker we logged an RSI skip for (avoids spam)
 SESSION_PNL = 0.00
 
 # ====================== TRADING SCHEDULE ======================
@@ -595,7 +596,9 @@ if __name__ == "__main__":
                             if rsi is None:
                                 time.sleep(5); continue
                             if rsi < RSI_MIN:
-                                log(f"⛔ RSI filter: {market.ticker} {side.upper()} RSI={rsi} < {RSI_MIN} — skip")
+                                if _last_skip_logged_ticker != market.ticker:
+                                    log(f"⛔ RSI filter: {market.ticker} {side.upper()} RSI={rsi} < {RSI_MIN} — skip")
+                                    _last_skip_logged_ticker = market.ticker
                                 time.sleep(3); continue
                             log(f"✅ RSI filter passed: RSI={rsi} >= {RSI_MIN}")
 
