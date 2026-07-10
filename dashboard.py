@@ -109,8 +109,16 @@ def build_snapshot():
     if not isinstance(trades, list):
         trades = []
 
-    # bot.py only ever sets state["paper_balance"] in PAPER_MODE.
-    is_paper = "paper_balance" in state
+    # Prefer the explicit mode the bot now writes to state ("PAPER"/"DEMO"/"LIVE").
+    # Fall back to the old heuristic (presence of paper_balance) only for state files
+    # written by an older bot.py that didn't record a mode.
+    state_mode = state.get("mode")
+    if state_mode in ("PAPER", "DEMO", "LIVE"):
+        is_paper = (state_mode == "PAPER")
+        mode_label = state_mode
+    else:
+        is_paper = "paper_balance" in state
+        mode_label = "PAPER" if is_paper else "LIVE"
     balance = state.get("paper_balance", PAPER_START_BALANCE) if is_paper else None
     strikes = state.get("strikes", 0)
     current_trade = state.get("current_trade")
@@ -147,7 +155,7 @@ def build_snapshot():
         spark.append(round(running, 2))
 
     return {
-        "mode": "PAPER" if is_paper else "LIVE",
+        "mode": mode_label,
         "balance": round(balance, 2) if balance is not None else None,
         "strikes": strikes,
         "strike_limit": STRIKE_LIMIT,
@@ -399,13 +407,14 @@ function el(tag, cls, text) {
 function renderStats(data) {
   const modePill = document.getElementById("mode-pill");
   modePill.textContent = data.mode;
-  modePill.classList.toggle("live", data.mode === "LIVE");
+  // Highlight any real-order mode (LIVE or DEMO sandbox) so it's visually distinct from PAPER.
+  modePill.classList.toggle("live", data.mode === "LIVE" || data.mode === "DEMO");
 
   const balanceEl = document.getElementById("stat-balance");
   const balanceSub = document.getElementById("stat-balance-sub");
   if (data.balance === null) {
-    balanceEl.textContent = "live account";
-    balanceSub.textContent = "balance shown in Kalshi";
+    balanceEl.textContent = data.mode === "DEMO" ? "demo account" : "live account";
+    balanceSub.textContent = data.mode === "DEMO" ? "sandbox balance in Kalshi demo" : "balance shown in Kalshi";
   } else {
     balanceEl.textContent = fmtMoney(data.balance);
     balanceSub.textContent = "paper trading";
