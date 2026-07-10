@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import time
 import math
@@ -122,6 +123,25 @@ SAFETY_FLOOR = 1000.0          # Live-mode cash floor.
 STRIKE_LIMIT_LIVE = 8          # Live-mode consecutive-loss halt threshold.
 STRIKE_LIMIT = None if PAPER_MODE else STRIKE_LIMIT_LIVE
 FILL_POLL_TRIES = 4            # Seconds to wait for a marketable limit order before canceling remainder.
+
+# --- Drawdown circuit breaker (LIVE MODE ONLY) ---
+# Tracks a high-water mark (the highest settled balance ever seen) in state.json
+# and halts the bot if the current settled balance falls by more than
+# MAX_DRAWDOWN_PCT from that peak. Unlike the cash floor (an absolute dollar
+# line) this is a RELATIVE guard that scales with the account: a 10% default
+# means "if I'm ever down 10% from my best, stop and let me look."
+#
+# IMPORTANT: this is a peak-to-current drawdown, i.e. balance <= peak * (1 - pct).
+# With MAX_DRAWDOWN_PCT = 0.10 and a $2,000 peak, the bot halts at $1,800.
+# Adjust the percentage to your risk tolerance (0.05 = tighter, 0.20 = looser).
+#
+# When tripped, the bot writes a persistent `halted` flag to state.json and
+# exits. It will NOT resume on restart — you must clear the halt yourself
+# (delete the "halted" key in state.json, or run: python bot.py --reset-halt)
+# so a drawdown stop is always a deliberate human decision to re-enter, never
+# an automatic restart into a losing streak. Paper mode ignores this entirely.
+USE_DRAWDOWN_LIMIT = True      # Live-mode only; no-op in paper mode.
+MAX_DRAWDOWN_PCT = 0.10        # Halt if settled balance falls this fraction below its peak.
 
 OVERRIDE_TRIGGERED = False
 _last_skip_logged_ticker = None  # Tracks last ticker we logged an RSI skip for (avoids spam)
@@ -312,6 +332,31 @@ def apply_pnl(state, pnl):
     if PAPER_MODE:
         state["paper_balance"] = round(state.get("paper_balance", PAPER_START_BALANCE) + pnl, 2)
 
+def update_peak_balance(state, balance):
+    """Track the high-water mark of settled balance for the drawdown circuit breaker.
+    Records the highest balance ever seen in state.json so the drawdown guard has a
+    stable reference across restarts. Returns the current peak."""
+    peak = state.get("peak_balance")
+    if peak is None or balance > peak:
+        state["peak_balance"] = round(balance, 2)
+        peak = state["peak_balance"]
+    return peak
+
+def check_drawdown_halt(state, balance):
+    """LIVE-MODE drawdown circuit breaker. Returns (should_halt, peak, floor_price).
+
+    Compares the current settled balance against the high-water mark. If balance has
+    fallen more than MAX_DRAWDOWN_PCT below the peak, signals a halt. Paper mode and
+    the disabled flag both short-circuit to no-halt. The peak is only meaningful once
+    at least one balance has been recorded, so a fresh account never trips on startup."""
+    if PAPER_MODE or not USE_DRAWDOWN_LIMIT:
+        return False, state.get("peak_balance"), None
+    peak = update_peak_balance(state, balance)
+    if peak is None or peak <= 0:
+        return False, peak, None
+    halt_level = peak * (1.0 - MAX_DRAWDOWN_PCT)
+    return balance <= halt_level, peak, halt_level
+
 # ====================== API SETUP ======================
 # NOTE: Even paper mode needs API keys to read live market data (prices, results).
 with open(APIKEY_FILE, "r", encoding="utf-8") as f: api_key_id = f.read().strip()
@@ -449,11 +494,47 @@ def flatten(curr, reason, trade_type):
 
 # ====================== MAIN LOOP ======================
 if __name__ == "__main__":
+    # --- CLI: clear a drawdown halt so the bot can run again ---
+    # A drawdown stop is deliberately sticky (see check_drawdown_halt): once tripped,
+    # state.json carries a `halted` flag and the bot refuses to start until a human
+    # clears it. `python bot.py --reset-halt` is that deliberate re-arm switch.
+    if "--reset-halt" in sys.argv:
+        _st = load_state()
+        _was = _st.pop("halted", None)
+        # Reset the high-water mark to the current balance so the freshly re-armed
+        # bot measures drawdown from where it stands now, not the old pre-loss peak.
+        if not PAPER_MODE:
+            try:
+                _bal = client.get_balance().balance / 100.0
+                _st["peak_balance"] = round(_bal, 2)
+            except Exception as _e:
+                print(f"[reset-halt] Could not read live balance to reset peak: {_e}")
+        save_state(_st)
+        if _was:
+            print(f"✅ Drawdown halt cleared. Peak reset to ${_st.get('peak_balance', 'n/a')}. "
+                  f"Bot can run again.")
+        else:
+            print("ℹ️ No active halt flag was set. Nothing to clear.")
+        sys.exit(0)
+
+    # --- Startup halt guard: refuse to run if a drawdown stop is active (live only) ---
+    # This makes the halt sticky across restarts: an accidental (or cron) restart won't
+    # silently resume trading into a drawdown. Clear it with `python bot.py --reset-halt`.
+    if not PAPER_MODE and USE_DRAWDOWN_LIMIT:
+        _boot_state = load_state()
+        if _boot_state.get("halted"):
+            _hb = _boot_state.get("halted_balance")
+            _hp = _boot_state.get("peak_balance")
+            log(f"🛑 Bot is HALTED by drawdown stop (balance ${_hb} vs peak ${_hp}). "
+                f"Run `python bot.py --reset-halt` to re-arm. Exiting.")
+            sys.exit(0)
+
     mode = "PAPER/SHADOW" if PAPER_MODE else "LIVE"
     stop_txt = f"stop {STOP_ARM_PRICE}->{STOP_TRIGGER_PRICE}c" if USE_STOP else "stop OFF (hold-to-settle)"
     rsi_txt  = f"RSI≥{RSI_MIN}" if USE_RSI_FILTER else "RSI filter OFF"
     fomc_txt = "skip FOMC days" if SKIP_FOMC_DAYS else "FOMC skip OFF"
-    log(f"🪄 Magick Bot v6.0.0 Active [{mode}] | {stop_txt} | schedule A (drop 17-22 ET) | {rsi_txt} | {fomc_txt}")
+    dd_txt   = f"drawdown halt {int(MAX_DRAWDOWN_PCT*100)}%" if (USE_DRAWDOWN_LIMIT and not PAPER_MODE) else "drawdown OFF"
+    log(f"🪄 Magick Bot v6.0.0 Active [{mode}] | {stop_txt} | schedule A (drop 17-22 ET) | {rsi_txt} | {fomc_txt} | {dd_txt}")
 
     while True:
         try:
@@ -496,9 +577,29 @@ if __name__ == "__main__":
 
             floor = PAPER_SAFETY_FLOOR if PAPER_MODE else SAFETY_FLOOR
             strike_halt = STRIKE_LIMIT is not None and state.get("strikes", 0) >= STRIKE_LIMIT
-            if cash <= floor or strike_halt:
-                reason = "cash floor" if cash <= floor else f"{STRIKE_LIMIT}-loss streak"
-                log(f"🚨 Shutdown ({reason}): Cash ${cash:.2f} | Strikes {state.get('strikes')}"); break
+            # Drawdown circuit breaker (live only): also updates the high-water mark.
+            dd_halt, dd_peak, dd_level = check_drawdown_halt(state, cash)
+            if not PAPER_MODE and USE_DRAWDOWN_LIMIT:
+                save_state(state)  # persist any new peak recorded by check_drawdown_halt
+            if cash <= floor or strike_halt or dd_halt:
+                if cash <= floor:
+                    reason = "cash floor"
+                elif strike_halt:
+                    reason = f"{STRIKE_LIMIT}-loss streak"
+                else:
+                    reason = f"{int(MAX_DRAWDOWN_PCT*100)}% drawdown (peak ${dd_peak:.2f} -> ${cash:.2f}, halt at ${dd_level:.2f})"
+                # A drawdown stop is sticky: write a persistent flag so the bot won't
+                # auto-resume on restart. Cash-floor and strike halts also break, but
+                # only the drawdown stop requires an explicit --reset-halt to clear.
+                if dd_halt:
+                    state["halted"] = True
+                    state["halted_reason"] = "drawdown"
+                    state["halted_balance"] = round(cash, 2)
+                    save_state(state)
+                log(f"🚨 Shutdown ({reason}): Cash ${cash:.2f} | Strikes {state.get('strikes')}")
+                if dd_halt:
+                    log("🛑 Drawdown halt is STICKY — run `python bot.py --reset-halt` to re-arm.")
+                break
 
             # --- TICKER FETCH ---
             resp = client.get_markets(series_ticker="KXBTC15M", limit=5, status="open")
