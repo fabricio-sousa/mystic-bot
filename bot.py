@@ -67,8 +67,17 @@ PAPER_MODE = False              # Shadow/paper trading. No real orders are place
 PAPER_START_BALANCE = 500.0   # Simulated starting cash; moves with realized PnL.
 PAPER_SAFETY_FLOOR = 0.0       # Paper floor (live SAFETY_FLOOR would block trading from $1000).
 
-FLAT_RISK = 0.05               
-MAX_POSITION_DOLLARS = 500.0
+FLAT_RISK = 0.05               # Fraction of cash staked per entry (before caps below).
+MAX_POSITION_DOLLARS = 500.0   # Dollar ceiling per entry.
+
+# Hard per-market contract cap — an INDEPENDENT safety layer on top of dollar/risk
+# sizing. The bot will never hold more than this many contracts in a single market,
+# combined across entries. This is a backstop against the 2026-07-10 over-buy bug,
+# where a position read-back failure let the bot re-enter repeatedly and stack ~70+
+# contracts in seconds. Enforcement is fail-safe: if the current position can't be
+# read, the bot SKIPS the entry rather than assuming flat. Set to a size you're
+# comfortable holding to settlement on one 15-min contract. 0 disables the cap.
+MAX_CONTRACTS_PER_MARKET = 10
 FEE_RATE = 0.07                # Kalshi trading-fee rate for paper/sim PnL. VERIFY against the
                                # current KXBTC15M schedule (get_series_fee_changes); fees change.
 
@@ -389,18 +398,47 @@ config.private_key_pem = private_key_pem
 client = KalshiClient(config)
 
 # ====================== EXCHANGE TRUTH HELPERS ======================
-def get_exchange_position(ticker):
+class PositionUnknown(Exception):
+    """Raised when the exchange position can't be read (API/parse error), so callers
+    can distinguish 'genuinely flat (0)' from 'we don't know'. Critical for the
+    position cap: an unknown position must NEVER be treated as 0, or the bot could
+    re-buy the full cap on top of an existing position (the 2026-07-10 over-buy bug)."""
+    pass
+
+def get_exchange_position(ticker, strict=False):
     """Signed net contracts held in `ticker` per the exchange (live only).
-    Positive = long YES, negative = long NO, 0 = flat. Paper mode has no real position."""
+    Positive = long YES, negative = long NO, 0 = flat. Paper mode has no real position.
+
+    If strict=True, raise PositionUnknown on any read/parse failure instead of
+    returning 0, so safety-critical callers don't mistake an error for 'flat'."""
     if PAPER_MODE:
         return 0
     try:
         mps = client.get_positions(ticker=ticker).market_positions or []
         for mp in mps:
             if mp.ticker == ticker:
-                return mp.position or 0
+                # V2 MarketPosition uses `position_fp` (fixed-point signed contract count),
+                # not the old V1 `position`. Parse defensively (may be int or numeric string).
+                raw = getattr(mp, "position_fp", None)
+                if raw is None:
+                    raw = getattr(mp, "position", None)  # legacy fallback
+                if raw is None:
+                    if strict:
+                        raise PositionUnknown(f"{ticker}: no position field on MarketPosition")
+                    return 0
+                try:
+                    return int(round(float(raw)))
+                except (TypeError, ValueError) as ce:
+                    if strict:
+                        raise PositionUnknown(f"{ticker}: unparseable position {raw!r}") from ce
+                    return 0
+        return 0   # ticker not in the list => genuinely flat
+    except PositionUnknown:
+        raise
     except Exception as e:
         log(f"⚠️ Position check error ({ticker}): {e}")
+        if strict:
+            raise PositionUnknown(f"{ticker}: {e}") from e
     return 0
 
 def weighted_fill_price(side, order_id=None, ticker=None, limit=200):
@@ -413,14 +451,35 @@ def weighted_fill_price(side, order_id=None, ticker=None, limit=200):
     except Exception as e:
         log(f"⚠️ Fills lookup error: {e}")
         return None
-    tot_cost = 0; tot_cnt = 0
+
+    def _num(v):
+        try: return float(v)
+        except (TypeError, ValueError): return None
+
+    tot_cost = 0.0; tot_cnt = 0.0
     for fl in fills:
-        c = fl.count or 0
-        if c <= 0: continue
-        p = fl.yes_price if side == "yes" else fl.no_price
-        if p is None: p = fl.price
-        if p is None: continue
-        tot_cost += p * c; tot_cnt += c
+        # V2 Fill uses `count_fp` (fixed-point count) and `yes_price_dollars` /
+        # `no_price_dollars` (dollar strings), NOT the old V1 `count` / `yes_price`.
+        c = _num(getattr(fl, "count_fp", None))
+        if c is None:
+            c = _num(getattr(fl, "count", None))  # legacy fallback
+        if c is None or c <= 0:
+            continue
+        # Price in dollars for the chosen side -> convert to cents.
+        if side == "yes":
+            pd = getattr(fl, "yes_price_dollars", None)
+        else:
+            pd = getattr(fl, "no_price_dollars", None)
+        p = _num(pd)
+        if p is not None:
+            p_cents = p * 100.0
+        else:
+            # legacy fallback: old cents fields
+            legacy = getattr(fl, "yes_price", None) if side == "yes" else getattr(fl, "no_price", None)
+            p_cents = _num(legacy)
+        if p_cents is None:
+            continue
+        tot_cost += p_cents * c; tot_cnt += c
     return round(tot_cost / tot_cnt) if tot_cnt > 0 else None
 
 def place_order(ticker, side, count, action, price_cents):
@@ -798,6 +857,29 @@ if __name__ == "__main__":
 
                         buy_price = min(99, ask_price + MAX_SLIPPAGE)
                         qty = int(min(MAX_POSITION_DOLLARS, (cash * FLAT_RISK)) * 100 // buy_price)
+
+                        # --- Hard per-market contract cap (independent safety layer) ---
+                        # Never let combined exposure in this market exceed the cap. Uses a
+                        # STRICT position read: if the exchange position can't be read, we do
+                        # NOT assume flat — we skip, because assuming flat on an error is exactly
+                        # what caused the over-buy. Paper mode has no real position (returns 0).
+                        if MAX_CONTRACTS_PER_MARKET and qty >= 1:
+                            try:
+                                held_now = abs(get_exchange_position(market.ticker, strict=True))
+                            except PositionUnknown as pe:
+                                log(f"🛑 Skipping entry — can't confirm current position "
+                                    f"({market.ticker}); not risking an over-buy. [{pe}]")
+                                time.sleep(5); continue
+                            room = MAX_CONTRACTS_PER_MARKET - held_now
+                            if room <= 0:
+                                log(f"🧢 Position cap reached: hold {held_now}/"
+                                    f"{MAX_CONTRACTS_PER_MARKET} in {market.ticker} — no more entries")
+                                time.sleep(5); continue
+                            if qty > room:
+                                log(f"🧢 Capping order {qty}->{room} "
+                                    f"(hold {held_now}, cap {MAX_CONTRACTS_PER_MARKET})")
+                                qty = room
+
                         if qty >= 1:
                             log(f"⚡ Entry at exactly 96c on {side.upper()}: ask {ask_price}c x{qty} (time left {time_left:.1f}min)")
                             res = place_order(market.ticker, side, qty, "buy", ask_price)
