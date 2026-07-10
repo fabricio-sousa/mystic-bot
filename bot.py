@@ -48,11 +48,20 @@ STATE_FILE = os.path.join(BASE_DIR, "state.json")
 TRADES_FILE = os.path.join(BASE_DIR, "trades.json")
 
 # --- Trading mode ---
-PAPER_MODE = True              # Shadow/paper trading. No real orders are placed.
+PAPER_MODE = False              # Shadow/paper trading. No real orders are placed.
 PAPER_START_BALANCE = 500.0   # Simulated starting cash; moves with realized PnL.
 PAPER_SAFETY_FLOOR = 0.0       # Paper floor (live SAFETY_FLOOR would block trading from $1000).
 
-FLAT_RISK = 0.05               
+# DEMO_MODE routes live order placement to Kalshi's SANDBOX (demo) exchange, which
+# uses mock funds — real V2 orders, fake money. Use this to prove the V2 order path
+# (especially the bid/ask + NO-price-inversion mapping) end-to-end before trading
+# real capital. Requires a SEPARATE demo account + demo API keys from demo.kalshi.co.
+# When True, PAPER_MODE must be False (you want real order calls, just on the sandbox).
+DEMO_MODE = False              # True = place real orders against the demo sandbox host.
+PROD_HOST = "https://api.elections.kalshi.com/trade-api/v2"
+DEMO_HOST = "https://demo-api.kalshi.co/trade-api/v2"
+
+FLAT_RISK = 0.15               
 MAX_POSITION_DOLLARS = 500.0
 FEE_RATE = 0.07                # Kalshi trading-fee rate for paper/sim PnL. VERIFY against the
                                # current KXBTC15M schedule (get_series_fee_changes); fees change.
@@ -109,7 +118,7 @@ STOP_ARM_PRICE = 75            # Only used if USE_STOP=True. Begin monitoring on
 STOP_TRIGGER_PRICE = 60        # Only used if USE_STOP=True. Exit once armed & bid <= this.
 
 # --- Risk rails ---
-SAFETY_FLOOR = 1000.0          # Live-mode cash floor.
+SAFETY_FLOOR = 300.0          # Live-mode cash floor.
 # --- Consecutive-loss circuit breaker ---
 # Counts LOSING STREAKS (reset to 0 on any win), not total losses. Halts the bot
 # when the streak reaches the limit. At a ~55% win rate a 3-loss streak is normal
@@ -122,7 +131,7 @@ SAFETY_FLOOR = 1000.0          # Live-mode cash floor.
 # Strike COUNTING stays active either way, so streaks still show in the logs.
 STRIKE_LIMIT_LIVE = 8          # Live-mode consecutive-loss halt threshold.
 STRIKE_LIMIT = None if PAPER_MODE else STRIKE_LIMIT_LIVE
-FILL_POLL_TRIES = 4            # Seconds to wait for a marketable limit order before canceling remainder.
+FILL_POLL_TRIES = 4            # (Unused since V2/IOC migration — IOC auto-cancels the unfilled remainder server-side.)
 
 # --- Drawdown circuit breaker (LIVE MODE ONLY) ---
 # Tracks a high-water mark (the highest settled balance ever seen) in state.json
@@ -362,7 +371,8 @@ def check_drawdown_halt(state, balance):
 with open(APIKEY_FILE, "r", encoding="utf-8") as f: api_key_id = f.read().strip()
 with open(PRIVATE_FILE, "r", encoding="utf-8") as f: private_key_pem = f.read()
 
-config = Configuration(host="https://api.elections.kalshi.com/trade-api/v2")
+_active_host = DEMO_HOST if DEMO_MODE else PROD_HOST
+config = Configuration(host=_active_host)
 config.api_key_id = api_key_id
 config.private_key_pem = private_key_pem
 client = KalshiClient(config)
@@ -406,8 +416,9 @@ def place_order(ticker, side, count, action, price_cents):
     """Returns {filled, remaining, avg_price_cents, order_id, fees_cents}.
 
     PAPER: simulates an immediate full fill (buy at bid+slippage, sell at the bid).
-    LIVE : submits a marketable limit order, waits briefly, then CANCELS any
-           unfilled remainder so no forgotten resting order can fill later."""
+    LIVE : submits a V2 immediate-or-cancel (IOC) marketable-limit order. IOC fills
+           whatever is available at/through our price immediately and the exchange
+           auto-cancels any unfilled remainder — so no resting order can linger."""
     if PAPER_MODE:
         if action == "buy":
             fill = min(99, price_cents + MAX_SLIPPAGE)
@@ -418,45 +429,80 @@ def place_order(ticker, side, count, action, price_cents):
 
     blank = {"filled": 0, "remaining": count, "avg_price_cents": None, "order_id": None, "fees_cents": 0}
     order_id = str(uuid.uuid4())
+    # Marketable-limit price in cents (same slippage logic as before).
     actual_price = min(99, price_cents + MAX_SLIPPAGE) if action == "buy" else max(1, price_cents - MAX_SLIPPAGE)
+
+    # --- V1 -> V2 order mapping -------------------------------------------------
+    # Kalshi retired the V1 /portfolio/orders create endpoint (HTTP 410). The V2
+    # endpoint (create_order_v2) quotes a SINGLE YES book: side="bid" buys YES,
+    # side="ask" sells YES. There is NO "buy NO" — buying NO is selling YES at
+    # (1 - price), and selling NO is buying YES at (1 - price). We mirror NO
+    # prices across the book accordingly. Prices go on the wire as fixed-point
+    # DOLLAR STRINGS ("0.96"), counts as strings; never floats.
+    #   buy  YES -> bid @ p            sell YES -> ask @ p
+    #   buy  NO  -> ask @ (1 - p)      sell NO  -> bid @ (1 - p)
+    if side == "yes":
+        book_side = "bid" if action == "buy" else "ask"
+        v2_price_cents = actual_price
+    elif side == "no":
+        book_side = "ask" if action == "buy" else "bid"
+        v2_price_cents = 100 - actual_price
+    else:
+        log(f"❌ Order submit error: unknown side {side!r}")
+        return blank
+    v2_price_dollars = f"{v2_price_cents / 100:.2f}"   # e.g. 96 -> "0.96"
+    v2_count = str(count)
+
+    # Log the exact mapping BEFORE sending so the first live/demo order is auditable.
+    log(f"📤 V2 order: {ticker} book_side={book_side} price={v2_price_dollars} "
+        f"count={v2_count} (from {side.upper()} {action} @ {actual_price}c) IOC")
+
     try:
-        resp = client.create_order(
-            ticker=ticker, side=side, action=action, count=count, type="limit",
+        # IOC: fill what's available at/through our price NOW, auto-cancel the rest
+        # server-side. This preserves the old "marketable then cancel remainder"
+        # behavior in one call, so no separate (now-removed) cancel_order is needed.
+        resp = client.create_order_v2(
+            ticker=ticker,
             client_order_id=order_id,
-            yes_price=actual_price if side == "yes" else None,
-            no_price=actual_price if side == "no" else None,
+            side=book_side,
+            count=v2_count,
+            price=v2_price_dollars,
+            time_in_force="immediate_or_cancel",
+            self_trade_prevention_type="taker_at_cross",
         )
-        order = resp.order
-        oid = order.order_id
     except Exception as e:
-        log(f"❌ Order submit error: {e}")
+        log(f"❌ Order submit error (V2): {e}")
         return blank
 
-    for _ in range(FILL_POLL_TRIES):
-        if (order.remaining_count or 0) == 0:
-            break
-        time.sleep(1)
-        try:
-            order = client.get_order(oid).order
-        except Exception as e:
-            log(f"⚠️ get_order error: {e}")
-            break
+    # V2 response is flat (not wrapped in .order) with fixed-point string fields:
+    # order_id, fill_count, remaining_count, average_fill_price, average_fee_paid.
+    # Read defensively so a shape surprise degrades gracefully instead of crashing.
+    def _num(v):
+        try: return float(v)
+        except (TypeError, ValueError): return 0.0
 
-    if (order.remaining_count or 0) > 0 and order.status != "canceled":
-        try:
-            order = client.cancel_order(oid).order
-        except Exception as e:
-            log(f"⚠️ Cancel FAILED — order {oid} may still be resting! {e}")
+    oid = getattr(resp, "order_id", None) or order_id
+    filled = int(_num(getattr(resp, "fill_count", 0)))
+    remaining = int(_num(getattr(resp, "remaining_count", count)))
 
-    filled = order.fill_count or 0
-    remaining = order.remaining_count or 0
-    fees = order.taker_fees or 0
+    # average_fee_paid is fixed-point dollars for the WHOLE order -> convert to cents.
+    fees = int(round(_num(getattr(resp, "average_fee_paid", 0)) * 100))
+
     avg = None
     if filled > 0:
+        # Prefer the authoritative fills lookup (already cents); fall back to the
+        # response's average_fill_price (dollars -> cents).
         avg = weighted_fill_price(side, order_id=oid)
-        if avg is None and order.taker_fill_cost:
-            avg = round(order.taker_fill_cost / filled)
-    return {"filled": filled, "remaining": remaining, "avg_price_cents": avg, "order_id": oid, "fees_cents": fees}
+        if avg is None:
+            afp = getattr(resp, "average_fill_price", None)
+            if afp is not None:
+                # average_fill_price is quoted on the YES book. For a NO position
+                # the YES-book fill price mirrors back: NO cost = 1 - YES price.
+                yes_cents = round(_num(afp) * 100)
+                avg = yes_cents if side == "yes" else (100 - yes_cents)
+
+    return {"filled": filled, "remaining": remaining, "avg_price_cents": avg,
+            "order_id": oid, "fees_cents": fees}
 
 def flatten(curr, reason, trade_type):
     """Sell the full tracked position at the live bid and realize PnL.
@@ -529,7 +575,7 @@ if __name__ == "__main__":
                 f"Run `python bot.py --reset-halt` to re-arm. Exiting.")
             sys.exit(0)
 
-    mode = "PAPER/SHADOW" if PAPER_MODE else "LIVE"
+    mode = "PAPER/SHADOW" if PAPER_MODE else ("LIVE-DEMO (sandbox funds)" if DEMO_MODE else "LIVE")
     stop_txt = f"stop {STOP_ARM_PRICE}->{STOP_TRIGGER_PRICE}c" if USE_STOP else "stop OFF (hold-to-settle)"
     rsi_txt  = f"RSI≥{RSI_MIN}" if USE_RSI_FILTER else "RSI filter OFF"
     fomc_txt = "skip FOMC days" if SKIP_FOMC_DAYS else "FOMC skip OFF"
