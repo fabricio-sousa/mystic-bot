@@ -76,7 +76,18 @@ MAX_SLIPPAGE = 0               # Pay up to ask (no slippage tolerance)
 ENTRY_TIME_MIN = 1.0           # Earliest entry: 1 min before close
 ENTRY_TIME_MAX = 10.0          # Latest entry: 10 min before close
 FLAT_RISK = 0.05               # Stake 5% of available cash per trade
+MAX_POSITION_DOLLARS = 500.0   # Dollar ceiling per entry
+MAX_CONTRACTS_PER_MARKET = 10  # Hard cap on combined contracts held in one market (0 = off)
 ```
+
+**Position cap (safety layer):** `MAX_CONTRACTS_PER_MARKET` is an independent hard
+ceiling on how many contracts the bot will ever hold in a single market, combined
+across entries. It trims an order to the remaining room, or skips once the cap is
+reached. Critically, it uses a **fail-safe position read**: if the exchange position
+can't be read, the bot **skips the entry rather than assuming it's flat** — this
+prevents the over-buy failure mode where a read-back error let the bot re-enter and
+stack a large position. This sits on top of `FLAT_RISK`/`MAX_POSITION_DOLLARS` sizing
+as a last line of defense, alongside the drawdown breaker.
 
 ### RSI Filter (Regime-Sensitive)
 ```python
@@ -450,6 +461,22 @@ mystic-bot/
 - Note: demo market prices/liquidity aren't representative of production — demo proves
   the order request/response works, not real fill behavior
 
+### "'Fill' object has no attribute 'count'" / "'MarketPosition' object has no attribute 'position'"
+- V1→V2 field-name mismatch in the fill/position read-back (fixed in v6.0.0)
+- V2 uses `count_fp` + `yes_price_dollars`/`no_price_dollars` on `Fill`, and
+  `position_fp` on `MarketPosition`
+- These errors are dangerous, not cosmetic: they blind the bot to its own position
+  and can cause repeated re-entry / over-buying. If you see them, you're on old code —
+  update `bot.py`
+- Protection: the per-market cap now uses a fail-safe position read (skips entry if
+  position can't be confirmed), and the drawdown breaker backstops the rest
+
+### Bot bought far more than expected / stacked a large position
+- Root cause was the parsing bug above (bot couldn't see its own position, re-entered)
+- Fixed, plus `MAX_CONTRACTS_PER_MARKET` now hard-caps combined size per market
+- If it still happens: check `MAX_CONTRACTS_PER_MARKET` isn't 0 (disabled), and confirm
+  `get_positions` is returning readable data (the cap skips entries when it can't)
+
 ---
 
 ## Development & Contributing
@@ -497,6 +524,8 @@ Built for algorithmic trading research. Attribution appreciated if you fork or a
 - ✅ V2 order migration: SDK 3.23.0, `create_order_v2` with IOC, YES/NO→bid/ask mapping, DEMO_MODE sandbox flag
 - ✅ Demo sandbox: separate demo key files, demo-aware cash floor ($10 vs $300 live)
 - ✅ Dashboard mode fix: reads explicit `state["mode"]` instead of stale `paper_balance`; shows DEMO distinctly
+- ✅ V2 fill/position parsing fix (`count_fp`/`*_price_dollars`/`position_fp`) — resolves live over-buy bug
+- ✅ Per-market contract cap (`MAX_CONTRACTS_PER_MARKET`) with fail-safe position read
 
 **v5.0.0 (May 2026):**
 - RSI implementation, backtest validation
