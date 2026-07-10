@@ -49,7 +49,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # real capital. Requires a SEPARATE demo account + demo API keys from demo.kalshi.co.
 # When True, PAPER_MODE must be False (you want real order calls, just on the sandbox).
 # NOTE: defined here (before the key-file paths) because those paths depend on it.
-DEMO_MODE = False              # True = place real orders against the demo sandbox host.
+DEMO_MODE = True              # True = place real orders against the demo sandbox host.
 PROD_HOST = "https://api.elections.kalshi.com/trade-api/v2"
 DEMO_HOST = "https://demo-api.kalshi.co/trade-api/v2"
 
@@ -604,6 +604,20 @@ if __name__ == "__main__":
             state = load_state()
             if PAPER_MODE and "paper_balance" not in state:
                 state["paper_balance"] = PAPER_START_BALANCE
+                save_state(state)
+            # Write an explicit mode signal for the dashboard, and clear any stale
+            # paper_balance left over from a previous paper run when we're now live/demo.
+            # (The dashboard used to infer paper-vs-live from the mere presence of
+            # paper_balance, which lingered after switching to live and mislabeled the mode.)
+            _mode_str = "PAPER" if PAPER_MODE else ("DEMO" if DEMO_MODE else "LIVE")
+            _state_dirty = False
+            if state.get("mode") != _mode_str:
+                state["mode"] = _mode_str
+                _state_dirty = True
+            if not PAPER_MODE and "paper_balance" in state:
+                del state["paper_balance"]   # stale paper data; live balance comes from the exchange
+                _state_dirty = True
+            if _state_dirty:
                 save_state(state)
 
             cash = state.get("paper_balance", PAPER_START_BALANCE) if PAPER_MODE else client.get_balance().balance / 100.0
