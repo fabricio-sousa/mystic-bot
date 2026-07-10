@@ -51,8 +51,7 @@ PAPER_MODE = True              # Shadow/paper trading. No real orders are placed
 PAPER_START_BALANCE = 500.0   # Simulated starting cash; moves with realized PnL.
 PAPER_SAFETY_FLOOR = 0.0       # Paper floor (live SAFETY_FLOOR would block trading from $1000).
 
-# --- Sizing (flat 25%) ---
-FLAT_RISK = 0.10               # Stake 25% of available cash per trade (flat, within the schedule windows).
+FLAT_RISK = 0.05               
 MAX_POSITION_DOLLARS = 500.0
 FEE_RATE = 0.07                # Kalshi trading-fee rate for paper/sim PnL. VERIFY against the
                                # current KXBTC15M schedule (get_series_fee_changes); fees change.
@@ -72,7 +71,7 @@ ENTRY_TIME_MAX = 10.0          # Minutes-before-close window end.
 # open market plus recently-settled ones — same series the bot already reads, no
 # external data source needed. See compute_rsi() for the multi-market merge.
 USE_RSI_FILTER = True          # Set False to disable and trade all 96c prints.
-RSI_MIN = 55                   # Skip entries where RSI-14 is below this threshold.
+RSI_MIN = 60                   # Skip entries where RSI-14 is below this threshold.
 RSI_LOOKBACK_MIN = 60          # Minutes of candle history to fetch (need >= 15 valid closes).
 
 # --- FOMC skip ---
@@ -105,8 +104,8 @@ FOMC_DECISION_DATES = {
 # The stop arms when the held-side bid falls to STOP_ARM_PRICE and exits when it
 # falls further to STOP_TRIGGER_PRICE. Set USE_STOP=False to hold to settlement.
 USE_STOP = True
-STOP_ARM_PRICE = 70            # Only used if USE_STOP=True. Begin monitoring once bid <= this.
-STOP_TRIGGER_PRICE = 53        # Only used if USE_STOP=True. Exit once armed & bid <= this.
+STOP_ARM_PRICE = 75            # Only used if USE_STOP=True. Begin monitoring once bid <= this.
+STOP_TRIGGER_PRICE = 60        # Only used if USE_STOP=True. Exit once armed & bid <= this.
 
 # --- Risk rails ---
 SAFETY_FLOOR = 1000.0          # Live-mode cash floor.
