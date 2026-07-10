@@ -111,7 +111,38 @@ STOP_TRIGGER_PRICE = 60        # Consolidation default (53 for Accumulation)
 STRIKE_LIMIT_LIVE = 8          # Live mode: halt after 8-loss streak
 STRIKE_LIMIT = None            # Paper mode: disabled (collect data)
 FILL_POLL_TRIES = 4            # Seconds to wait for order fill before cancel
+
+# --- Drawdown circuit breaker (LIVE MODE ONLY) ---
+USE_DRAWDOWN_LIMIT = True      # No-op in paper mode
+MAX_DRAWDOWN_PCT = 0.10        # Halt if settled balance falls 10% below its peak
 ```
+
+### Drawdown Circuit Breaker (Live Only)
+
+A **relative** risk guard that complements the absolute cash floor. It tracks a
+**high-water mark** (the highest settled balance ever seen, stored in `state.json`)
+and halts the bot if the settled balance falls more than `MAX_DRAWDOWN_PCT` below
+that peak.
+
+- **Peak-to-current drawdown:** halts when `balance <= peak * (1 - MAX_DRAWDOWN_PCT)`.
+  With a 10% limit and a $2,000 peak, the bot stops at $1,800.
+- **Scales with the account:** unlike the fixed `SAFETY_FLOOR`, it tightens as the
+  account grows (a 10% giveback from a new high always triggers).
+- **Sticky by design:** when tripped, it writes a persistent `halted` flag to
+  `state.json` and exits. **The bot will NOT auto-resume on restart** — this
+  prevents a cron job or accidental restart from trading back into a drawdown.
+- **Manual re-arm required:** clear the halt with:
+  ```bash
+  python bot.py --reset-halt
+  ```
+  This removes the flag and resets the high-water mark to the *current* balance,
+  so drawdown is measured from where you actually stand on re-entry (not the old
+  pre-loss peak).
+- **Paper mode ignores it entirely** — data-collection runs never get cut short.
+
+**Tuning:** `0.05` = tighter (5% giveback stops), `0.20` = looser (ride out more
+volatility). Match it to your regime — consolidation warrants a tighter limit than
+a strong accumulation uptrend.
 
 ---
 
@@ -238,6 +269,7 @@ FLAT_RISK = 0.20         # 2x position size (highest edge)
 - Requires API key + private key
 - Requires `SAFETY_FLOOR = 1000.0` (won't trade if cash < floor)
 - Requires `STRIKE_LIMIT = 8` (halts after 8-loss streak)
+- Drawdown breaker active (`USE_DRAWDOWN_LIMIT = True`): sticky halt at 10% below peak, needs `--reset-halt` to resume
 - First trade is live; test with small size first
 
 **Recommended:** Run 1–2 weeks in paper mode to verify RSI filter and stop-loss behavior in live market data before switching to live.
@@ -327,6 +359,19 @@ mystic-bot/
 - Set to positive value to halt trading if underwater
 - Check stop-loss: if triggering too late, losses accumulate faster than expected
 
+### Bot exits immediately with "Bot is HALTED by drawdown stop"
+- The live drawdown breaker tripped on a prior run (balance fell ≥10% below peak)
+- This is intentional and sticky — it won't resume until you clear it
+- Review recent trades in `trades.json` to understand the drawdown before re-arming
+- When ready, run `python bot.py --reset-halt` to clear the flag and reset the peak
+- If you want a looser limit, raise `MAX_DRAWDOWN_PCT` before restarting
+
+### Drawdown breaker tripping too easily / too late
+- Too easily: raise `MAX_DRAWDOWN_PCT` (e.g., 0.15 or 0.20) for more room
+- Too late: lower it (e.g., 0.05) for a tighter stop
+- Remember it measures from the **peak**, not your starting balance — after a run-up,
+  the halt level rises with it
+
 ---
 
 ## Development & Contributing
@@ -370,6 +415,7 @@ Built for algorithmic trading research. Attribution appreciated if you fork or a
 - ✅ SDK resilience patch: tolerate null booleans during API outages
 - ✅ Consolidation tuning: RSI 60, 5% size, tighter stops (75→60)
 - ✅ Bitcoin regimes documentation: Euphoria/Accumulation/Consolidation/Capitulation guide
+- ✅ Drawdown circuit breaker (live only): sticky halt at 10% below high-water mark, `--reset-halt` to re-arm
 
 **v5.0.0 (May 2026):**
 - RSI implementation, backtest validation
