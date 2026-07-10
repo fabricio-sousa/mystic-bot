@@ -62,9 +62,12 @@ All settings in top of `bot.py`, lines 41–130:
 ### Trading Mode
 ```python
 PAPER_MODE = True              # False = live trading (requires API keys)
+DEMO_MODE = False              # True = real orders on Kalshi demo sandbox (mock funds)
 PAPER_START_BALANCE = 500.0    # Starting cash for paper mode
 PAPER_SAFETY_FLOOR = 0.0       # Don't fall below this in paper
-SAFETY_FLOOR = 1000.0          # Live-mode cash floor (blocks trading if breach)
+SAFETY_FLOOR_LIVE = 300.0      # Real live-mode cash floor (blocks trading if breached)
+SAFETY_FLOOR_DEMO = 10.0       # Sandbox floor so demo runs on a small mock balance
+SAFETY_FLOOR = SAFETY_FLOOR_DEMO if DEMO_MODE else SAFETY_FLOOR_LIVE
 ```
 
 ### Entry
@@ -180,6 +183,8 @@ Requires Kalshi API key + private key (free to register at https://kalshi.com):
 1. Store API key ID in `apikey.txt` (single line)
 2. Store private key PEM in `private.txt` (multi-line)
 3. Both files in same directory as `bot.py`
+4. For demo testing, add `apikey_demo.txt` + `private_demo.txt` (demo account keys);
+   the bot uses these automatically when `DEMO_MODE = True`
 
 Even paper mode requires API keys to read live market data & candles.
 
@@ -199,9 +204,23 @@ fake money — the right way to confirm the order path (especially the YES/NO �
 price mapping) before trading real capital.
 
 - Requires a **separate demo account** and demo API keys from https://demo.kalshi.co
+- Demo uses its **own key files** so credentials never mix with prod:
+  - `apikey_demo.txt` (demo key ID)
+  - `private_demo.txt` (demo private key PEM)
+  - The bot auto-selects these when `DEMO_MODE = True`; no manual swapping
+- **Fund the demo account** with mock money from the demo dashboard first, or the
+  cash floor will shut the bot down immediately (`Shutdown (cash floor): Cash $0.00`)
+- The demo cash floor is only `SAFETY_FLOOR_DEMO` ($10), so a small mock balance is
+  enough — the real `SAFETY_FLOOR_LIVE` ($300) still governs actual live trading
 - `PAPER_MODE` must be `False` (you want real order calls, just on the sandbox)
 - The startup banner shows `LIVE-DEMO (sandbox funds)` so it's never confused with real live
 - Recommended flow: **paper → demo (one real sandbox order) → live**
+
+> **Note on demo liquidity:** Kalshi's sandbox often has thin or stale order books on
+> the fast KXBTC15M 15-min markets, so a demo order may not fill even with correct code.
+> Demo reliably proves the *request/response shape* (that the V2 call is accepted and
+> parsed), but for real fill behavior a tiny 1-contract live order (~$1) is more
+> representative.
 
 **How V2 orders work (for reference):** Kalshi V2 quotes a single YES book — buying YES is a
 `bid`, buying NO is an `ask` at `1 − price` (NO is the mirror of YES). The bot handles this
@@ -227,8 +246,14 @@ Throttled RSI skip logging: only logs the first skip per market ticker (avoids s
 
 ### Output Files
 - `log.txt` — Full event log (same as console, timestamped)
-- `state.json` — Current session balance, trade count, streak counter
+- `state.json` — Current session state: `mode` (PAPER/DEMO/LIVE), strikes, current trade, peak balance, and `paper_balance` (paper mode only)
 - `trades.json` — Full trade history (entry price, exit price, settlement, PnL)
+
+### Dashboard
+
+`dashboard.py` is an optional single-file Flask dashboard (backend + HTML/CSS/JS in one file). Drop it next to `bot.py` and run it to get a local web UI showing current mode, balance, session/total PnL, strike count, recent trades, and a PnL sparkline. It reads `state.json` and `trades.json` — no coupling to the bot beyond those files.
+
+The mode shown (PAPER / DEMO / LIVE) comes from the explicit `state["mode"]` field the bot writes each loop. (Earlier it was inferred from the presence of `paper_balance`, which lingered after switching from paper to live and mislabeled the mode — now fixed.)
 
 ---
 
@@ -292,7 +317,7 @@ FLAT_RISK = 0.20         # 2x position size (highest edge)
 ### Live Mode (`PAPER_MODE = False`)
 - Places real orders on Kalshi
 - Requires API key + private key
-- Requires `SAFETY_FLOOR = 1000.0` (won't trade if cash < floor)
+- Requires `SAFETY_FLOOR_LIVE = 300.0` (won't trade if cash < floor)
 - Requires `STRIKE_LIMIT = 8` (halts after 8-loss streak)
 - Drawdown breaker active (`USE_DRAWDOWN_LIMIT = True`): sticky halt at 10% below peak, needs `--reset-halt` to resume
 - First trade is live; test with small size first
@@ -345,13 +370,17 @@ Check `trades.json` for full history: entry/exit prices, settlement, fees, PnL p
 
 ```
 mystic-bot/
-├── bot.py                        # Main bot script (this file)
-├── apikey.txt                    # API key ID (not in git)
-├── private.txt                   # Private key PEM (not in git)
+├── bot.py                        # Main bot script
+├── dashboard.py                  # Optional local Flask dashboard
+├── apikey.txt                    # Prod API key ID (not in git)
+├── private.txt                   # Prod private key PEM (not in git)
+├── apikey_demo.txt               # Demo API key ID — used when DEMO_MODE=True (not in git)
+├── private_demo.txt              # Demo private key PEM — used when DEMO_MODE=True (not in git)
 ├── log.txt                       # Full event log (generated)
-├── state.json                    # Current session state (generated)
+├── state.json                    # Current session state incl. mode field (generated)
 ├── trades.json                   # Full trade history (generated)
 ├── bitcoin_regimes_strategy.md   # Regime tuning guide
+├── Mystic-Bot.md                 # Development log / memory dump
 └── README.md                     # This file
 ```
 
@@ -404,6 +433,23 @@ mystic-bot/
 - Remember it measures from the **peak**, not your starting balance — after a run-up,
   the halt level rises with it
 
+### Dashboard shows PAPER when the bot is running live/demo
+- Caused by a stale `paper_balance` key left in `state.json` from an earlier paper run
+- Fixed: the bot now writes an explicit `mode` field and clears the stale key on its
+  next run — just restart the bot and it self-heals
+- To fix the dashboard immediately without restarting, delete the `"paper_balance"`
+  line from `state.json`
+
+### Demo mode: "Shutdown (cash floor): Cash $0.00"
+- The demo account has no mock funds yet (not a bug — auth and balance read are working)
+- Fund it at https://demo.kalshi.co (the `.co` domain): deposit → pick any bank from the
+  mock list → wait for the mock ACH to settle (not instant)
+- Demo cash floor is `SAFETY_FLOOR_DEMO` ($10), so a small mock balance is enough
+- Verify balance directly: read `client.get_balance().balance` against the demo host;
+  once it's non-zero, restart the bot
+- Note: demo market prices/liquidity aren't representative of production — demo proves
+  the order request/response works, not real fill behavior
+
 ---
 
 ## Development & Contributing
@@ -449,6 +495,8 @@ Built for algorithmic trading research. Attribution appreciated if you fork or a
 - ✅ Bitcoin regimes documentation: Euphoria/Accumulation/Consolidation/Capitulation guide
 - ✅ Drawdown circuit breaker (live only): sticky halt at 10% below high-water mark, `--reset-halt` to re-arm
 - ✅ V2 order migration: SDK 3.23.0, `create_order_v2` with IOC, YES/NO→bid/ask mapping, DEMO_MODE sandbox flag
+- ✅ Demo sandbox: separate demo key files, demo-aware cash floor ($10 vs $300 live)
+- ✅ Dashboard mode fix: reads explicit `state["mode"]` instead of stale `paper_balance`; shows DEMO distinctly
 
 **v5.0.0 (May 2026):**
 - RSI implementation, backtest validation
