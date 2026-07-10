@@ -183,6 +183,31 @@ Requires Kalshi API key + private key (free to register at https://kalshi.com):
 
 Even paper mode requires API keys to read live market data & candles.
 
+**SDK requirement:** order placement uses Kalshi's **V2 endpoint** (`create_order_v2`),
+which needs `kalshi_python_sync` **3.23.0+** (older versions were V1-only, and Kalshi's V1
+create endpoint now returns HTTP 410 Gone). The SDK requires Python 3.13+.
+
+```bash
+pip install --upgrade kalshi_python_sync   # must be >= 3.23.0
+```
+
+### Demo (sandbox) testing — prove orders before risking real money
+
+Set `DEMO_MODE = True` to route order placement to Kalshi's demo sandbox
+(`demo-api.kalshi.co`), which uses **mock funds**. This places *real* V2 orders against
+fake money — the right way to confirm the order path (especially the YES/NO → bid/ask
+price mapping) before trading real capital.
+
+- Requires a **separate demo account** and demo API keys from https://demo.kalshi.co
+- `PAPER_MODE` must be `False` (you want real order calls, just on the sandbox)
+- The startup banner shows `LIVE-DEMO (sandbox funds)` so it's never confused with real live
+- Recommended flow: **paper → demo (one real sandbox order) → live**
+
+**How V2 orders work (for reference):** Kalshi V2 quotes a single YES book — buying YES is a
+`bid`, buying NO is an `ask` at `1 − price` (NO is the mirror of YES). The bot handles this
+conversion internally and logs the exact mapping before every order. Orders are
+immediate-or-cancel (IOC): they fill what's available now and the exchange auto-cancels the rest.
+
 ---
 
 ## Logging & Output
@@ -344,6 +369,13 @@ mystic-bot/
 - Bot recovers automatically via SDK resilience patch
 - Monitor Kalshi status page; usually resolves in 15–30 min
 
+### "Order submit error: (410) Gone — deprecated_v1_order_endpoint"
+- Kalshi retired the V1 order endpoint; your SDK is placing V1 orders
+- Fix: upgrade the SDK to 3.23.0+ (`pip install --upgrade kalshi_python_sync`)
+- v6.0.0+ already uses V2 (`create_order_v2`); if you still see this, your
+  installed SDK is older than 3.23.0 or an old bot.py is running
+- Verify: `python -c "import kalshi_python_sync as k; print(k.__version__)"`
+
 ### "No open KXBTC15M markets found"
 - Market is closed (off-hours)
 - Schedule A only trades 5 PM–10 PM ET drop window
@@ -378,11 +410,11 @@ mystic-bot/
 
 **Last updated:** July 2026  
 **Python:** 3.9+  
-**Dependencies:** `kalshi-python-sdk`, `pytz`, `pydantic`
+**Dependencies:** `kalshi_python_sync` (>= 3.23.0, needs Python 3.13+), `pytz`, `pydantic`
 
 Install:
 ```bash
-pip install kalshi-python-sdk pytz pydantic
+pip install "kalshi_python_sync>=3.23.0" pytz pydantic
 ```
 
 **Testing changes:**
@@ -416,6 +448,7 @@ Built for algorithmic trading research. Attribution appreciated if you fork or a
 - ✅ Consolidation tuning: RSI 60, 5% size, tighter stops (75→60)
 - ✅ Bitcoin regimes documentation: Euphoria/Accumulation/Consolidation/Capitulation guide
 - ✅ Drawdown circuit breaker (live only): sticky halt at 10% below high-water mark, `--reset-halt` to re-arm
+- ✅ V2 order migration: SDK 3.23.0, `create_order_v2` with IOC, YES/NO→bid/ask mapping, DEMO_MODE sandbox flag
 
 **v5.0.0 (May 2026):**
 - RSI implementation, backtest validation
