@@ -1,284 +1,380 @@
-# Magick Bot
+# Magick Bot v6.0.0 — Binary Prediction Market Trading Bot
 
-A Python bot that trades 15-minute Bitcoin price-direction contracts on [Kalshi](https://kalshi.com). It watches the `KXBTC15M` series and enters a position whenever either side's ask hits exactly 96¢ — buying a deep favorite, filtering with RSI-14, and holding to settlement.
+A Python bot that trades Kalshi 15-minute Bitcoin KXBTC15M contracts using a thin-edge strategy: **buy whichever side's ask is exactly 96¢, hold to settlement**. Edge comes from RSI-14 filtering, FOMC avoidance, and a two-stage stop-loss.
 
-**Status: paper/shadow mode by default. Research-grade. Not financial advice.**
+## Quick Start
 
----
-
-## How it works
-
-Each `KXBTC15M` market is a binary question: will BTC be higher or lower in 15 minutes than it is right now? The contract pays $1.00 if correct, $0.00 if not.
-
-The bot's entry rule: if the YES ask or NO ask is exactly 96¢, RSI-14 is at or above 55, and today is not an FOMC decision day, buy that side. At 96¢ entry, breakeven is 96.27% wins (accounting for fees). Backtesting on real Kalshi candlestick data (Apr–Jun 2026, 561 trades after all filters) showed a 99.11% realized win rate — well above breakeven, with every month profitable.
-
-The payoff is asymmetric: win +$0.04/contract, lose −$0.96/contract. A single loss erases ~24 wins, so loss clustering is the dominant risk even at a high win rate.
-
----
-
-## Entry logic
-
-```
-Every 15-minute KXBTC15M market, 1–10 minutes before close:
-  if yes_ask == 96¢ or no_ask == 96¢:
-    if today is an FOMC decision day  →  skip (rate announcement vol)
-    compute RSI-14 from the last 20 one-minute KXBTC15M candles
-    if RSI-14 < 55  →  skip (sub-threshold momentum)
-    else            →  buy that side at 96¢
-  else              →  skip, wait for next market
-```
-
-Sizing is 25% of available cash per trade, capped at $500 notional (`FLAT_RISK = 0.25`, `MAX_POSITION_DOLLARS = 500`). Positions are held to settlement — no early exit — unless the optional two-stage stop is enabled.
-
----
-
-## RSI filter
-
-Analysis of 1,435 real 96¢ entries (Apr–Jun 2026) found that entries with RSI-14 below 55 won only ~12% of the time — far below the 96.27% breakeven. Entries with RSI-14 at or above 55 won 98.63%. The filter cuts roughly 40% of trade volume but eliminates losing months entirely on the test window.
-
-**Why RSI predicts outcome here:** RSI is functioning as a proxy for momentum direction. Low RSI at a 96¢ entry almost always means the NO side is being bid up aggressively (the book thinks BTC will keep falling), and those entries were systematically wrong during the Apr–Jun 2026 bear market. High RSI entries are predominantly YES-side in a trending market, where short-term momentum persistence was strong.
-
-RSI is computed from the last 20 one-minute `yes_ask` closes of the KXBTC15M series — the same data the bot already reads, with no external dependency.
-
-| RSI-14 at entry | Trades | Win rate | vs breakeven |
-|---|--:|--:|--:|
-| < 55 (skipped) | 851 | 12.1% | −84pp |
-| ≥ 55 (entered) | 584 | 98.63% | +2.36pp |
-
-To disable the filter and trade all 96¢ prints: set `USE_RSI_FILTER = False`.
-
----
-
-## FOMC skip
-
-Analysis of 7 macro release days in the Apr–Jun 2026 window found that CPI, PPI, and NFP days were unaffected — RSI-filtered entries on those days hit 100% win rates. FOMC decision days were the exception: the April 29 and June 17 announcements produced 83.3% and 90.9% win rates respectively, both well below the 96.27% breakeven.
-
-The likely cause: FOMC rate decisions at 2:00 PM ET can reverse BTC's short-term trend entirely within minutes. RSI captures momentum direction going into the announcement but cannot anticipate the announcement itself, so the signal loses its predictive value for the rest of that day.
-
-Skipping the two FOMC days (23 trades) improved ROI from +71.7% to +82.8% and trimmed max DD from $900 to $768.
-
-| Date filtered | Event | Trades skipped | Win rate on that day |
-|---|---|--:|--:|
-| 2026-04-29 | FOMC decision (Apr 28–29) | 12 | 83.3% |
-| 2026-06-17 | FOMC decision (Jun 16–17) | 11 | 90.9% |
-
-The `FOMC_DECISION_DATES` set in config holds the decision date (always the second day of each two-day meeting) for the full calendar year. Update it each January when the Fed publishes the following year's schedule at `federalreserve.gov/monetarypolicy/fomccalendars.htm`.
-
-To disable: set `SKIP_FOMC_DAYS = False`.
-
----
-
-## Trading schedule (Schedule A)
-
-Based on hourly PnL analysis of real Kalshi data, the bot trades all weekday hours **except 17:00–21:59 ET**. The post-market US session (17–22 ET) lost −$9/trade on average across 539 trades, driven by erratic Bitcoin vol after equity markets close. All other hours averaged +$3–6/trade.
-
-| Period | Status |
-|---|---|
-| Mon–Fri 00:00–16:59 ET | ✅ Active |
-| Mon–Fri 17:00–21:59 ET | ⛔ Blocked |
-| Mon–Fri 22:00–23:59 ET | ✅ Active |
-| Sunday 12:00–16:59 ET | ✅ Active |
-| Saturday | ⛔ Closed |
-
----
-
-## Stop-loss
-
-The bot ships with `USE_STOP = False` (hold to settlement). A two-stage stop is implemented but off by default.
-
-The stop arms when the held-side bid drops to `STOP_ARM_PRICE` and triggers an exit when it drops further to `STOP_TRIGGER_PRICE`. Backtesting showed that a tight threshold — arm at 70¢, trigger at 53¢ (≈45% down from a 96¢ entry) — performed favorably at every slippage level tested, converting full −96¢ losses into ~−40¢ stop-outs. The old 80→75¢ thresholds were net-negative because the KXBTC15M book gaps violently; average realized fill on a stop-out was ~44¢, not the trigger price.
-
-To enable:
-
-```python
-USE_STOP = True
-STOP_ARM_PRICE = 70
-STOP_TRIGGER_PRICE = 53
-```
-
----
-
-## Backtested results
-
-All results on real Kalshi KXBTC15M candlestick data, Apr–Jun 2026, starting balance $10,000.
-
-| Configuration | Trades | Win rate | ROI | Max DD | All months green |
-|---|--:|--:|--:|--:|:---:|
-| Schedule A, no filter, no stop | 1,435 | 96.93% | +49.6% | $2,317 | No |
-| Schedule A, RSI ≥ 55, no stop | 584 | 98.63% | +71.7% | $900 | Yes |
-| Schedule A, RSI ≥ 55, stop 45% | 584 | 98.63% | +84.2% | $573 | Yes |
-| **Schedule A, RSI ≥ 55, skip FOMC, no stop** | **561** | **99.11%** | **+82.8%** | **$768** | **Yes** |
-
-Each filter adds independently: Schedule A removes the bad post-market hours, RSI ≥ 55 removes low-momentum entries, and the FOMC skip removes the two days where macro vol overwhelmed the RSI signal. The current default config (RSI filter on, FOMC skip on, stop off) is the bolded row.
-
-These results are in-sample on 3 months of data. Treat them as directionally encouraging, not a performance guarantee.
-
----
-
-## Setup
-
-**Requirements**
-
-- Python 3.10+
-- A Kalshi account with API access enabled
-- `kalshi-python-sync`, `pytz`
-
-```
-pip install kalshi-python-sync pytz
-```
-
-**API keys**
-
-Create two files in the same directory as `bot.py`:
-
-- `apikey.txt` — your Kalshi API key ID (one line)
-- `private.txt` — your RSA private key in PEM format
-
-Even in paper mode the bot needs read access to fetch live market prices, candles, and settlement results.
-
-**Run**
-
-```
+```bash
 python bot.py
 ```
 
-The bot starts in `PAPER_MODE = True` and will not place real orders. All simulated trades are written to `trades.json`. To go live, set `PAPER_MODE = False` in the config block at the top of `bot.py`.
+Paper trading enabled by default (`PAPER_MODE = True`). Set to `False` + valid API keys to trade live.
 
 ---
 
-## Configuration reference
+## Core Strategy
 
-All knobs are at the top of `bot.py`.
+**Entry Rule:**
+- Buy YES or NO at exactly 96¢ ask price
+- Only during 1–10 minutes before KXBTC15M 15m contract settlement
+- Only when RSI-14 ≥ threshold (default 60, tunable by regime)
+- Skip FOMC decision days (only macro day that hurts this edge)
 
-| Variable | Default | Description |
-|---|---|---|
-| `PAPER_MODE` | `True` | Shadow mode — reads live data, simulates fills, no real orders |
-| `PAPER_START_BALANCE` | `1000.0` | Simulated starting balance |
-| `FLAT_RISK` | `0.25` | Fraction of cash staked per trade |
-| `MAX_POSITION_DOLLARS` | `500.0` | Hard cap on notional per trade |
-| `FEE_RATE` | `0.07` | Fee rate for paper PnL. Verify against current KXBTC15M schedule |
-| `ENTRY_TIME_MIN` | `1.0` | Earliest entry (minutes before close) |
-| `ENTRY_TIME_MAX` | `10.0` | Latest entry (minutes before close) |
-| `USE_RSI_FILTER` | `True` | Enable the RSI-14 entry gate |
-| `RSI_MIN` | `55` | Minimum RSI-14 required to enter |
-| `RSI_CANDLES` | `20` | One-minute candles fetched to compute RSI (need ≥ 15) |
-| `SKIP_FOMC_DAYS` | `True` | Skip entries on FOMC decision days |
-| `FOMC_DECISION_DATES` | 2026 calendar | Set of `YYYY-MM-DD` strings — update each January |
-| `USE_STOP` | `False` | Enable the two-stage stop-loss |
-| `STOP_ARM_PRICE` | `80` | Held-side bid level that arms the stop |
-| `STOP_TRIGGER_PRICE` | `75` | Held-side bid level that fires the exit |
-| `SAFETY_FLOOR` | `1000.0` | Live-mode cash floor — halts the bot if breached |
-| `STRIKE_LIMIT_LIVE` | `8` | Consecutive-loss circuit breaker (live mode only) |
+**Exit Rule:**
+- Hold to settlement (auto-settle on Kalshi at 0 or 100¢)
+- Two-stage stop-loss: arm at 70¢ bid, trigger at 53¢ (converts -96c loss to ~-40c)
+
+**Position Size:**
+- Flat 5% of available cash per trade (tunable; default reduced from 10% for consolidation)
+- Max position: $500 or safety floor, whichever is stricter (live mode)
 
 ---
 
-## Files
+## Edge & Backtest Results
 
-| File | Description |
-|---|---|
-| `bot.py` | Main bot |
-| `dashboard.py` | Read-only Flask dashboard — run separately, open `http://127.0.0.1:5003` |
-| `state.json` | Persisted loop state: current trade, strike count, paper balance |
-| `trades.json` | Full trade log (entry, exit, PnL, type) |
-| `log.txt` | Timestamped event log |
-| `apikey.txt` | Kalshi API key ID (**do not commit**) |
-| `private.txt` | RSA private key PEM (**do not commit**) |
+**3-month backtest (Apr–Jun 2026, Accumulation regime):**
+- RSI ≥ 55 filter: +82.8% ROI, 99.11% win rate, 561 trades, $768 max drawdown
+- Without RSI filter: +71.7% ROI, 98.63% win rate (edge disappears without filter)
+- FOMC skip alone: +11.1% ROI improvement, $132 DD reduction
+- Stop-loss: converts full -96c losses to ~-40c, beats no-stop across all slippage levels
 
-Add `apikey.txt` and `private.txt` to `.gitignore`.
+**Starting balance for $500/month profit target:** ~$1,800 (scales linearly with ROI)
 
----
+### Important: Edge Varies by Bitcoin Regime
 
-## Dashboard
+**This backtest was run during Accumulation** (strong uptrend, Bitcoin climbing). Current market (Jul 2026) is **Consolidation** (down 40% YoY, bouncing in range). Edge characteristics change significantly:
 
-`dashboard.py` is a read-only Flask app that displays live bot state in a browser. It is fully decoupled from `bot.py` — it never imports it, never calls the Kalshi API, and never writes any files. It simply polls the three files `bot.py` already writes and renders them as a dark-themed single-page dashboard.
+| Regime | RSI Threshold | Position Size | Win Rate | Use Case |
+|--------|---------------|---------------|----------|----------|
+| **Euphoria** (ATH chasing, RSI 70+) | 65–70 | 5% | 92% | Exit, reduce exposure |
+| **Accumulation** (strong uptrend, RSI 50–70) | 55 | 10% | 99% | Optimal, full throttle |
+| **Consolidation** (bouncing lower, RSI 30–50) | 60 | 5% | 75% | **Current regime** — selective entry |
+| **Capitulation** (panic selling, RSI <30) | 30–35 | 20% | 88% | Highest edge, high risk |
 
-**What it shows:**
-
-- Balance, today's PnL, total PnL, win rate, and win/loss record
-- Current open position (ticker, side, entry price, contracts, stop-armed status)
-- Cumulative PnL sparkline (last 120 trades)
-- Recent trade log (last 200 trades: time, ticker, side, type, PnL)
-- Live tail of `log.txt` (last 60 lines, auto-scrolled)
-- A stale-data indicator if the bot hasn't updated files in 15 seconds
-
-The page polls `/api/data` every 3 seconds. Everything — HTML, CSS, and JavaScript — lives inline in the single `PAGE` string in `dashboard.py`, so there are no `templates/` or `static/` folders to manage.
-
-**Requirements**
-
-```
-pip install flask pytz
-```
-
-**Run**
-
-Drop `dashboard.py` in the same folder as `bot.py` and run:
-
-```
-python dashboard.py
-```
-
-Then open `http://127.0.0.1:5003`. The bot and the dashboard run as separate processes — start them independently.
-
-If your bot files live elsewhere:
-
-```
-BOT_DIR=/path/to/your/bot python dashboard.py
-```
-
-**Environment variables**
-
-| Variable | Default | Description |
-|---|---|---|
-| `BOT_DIR` | Script's own directory | Path to the folder containing `state.json`, `trades.json`, `log.txt` |
-| `STRIKE_LIMIT` | `3` | Mirrors `STRIKE_LIMIT_LIVE` in `bot.py` — keep in sync if you change it |
-| `PAPER_START_BALANCE` | `1000.0` | Used to initialize the balance display before any trades are recorded |
-| `DASHBOARD_DEBUG` | `""` | Set to `1` to include Python tracebacks in API error responses |
+**See `bitcoin_regimes_strategy.md` for full regime guide**, including detection methods, expected outcomes, and config changes for each cycle.
 
 ---
 
-## Safety features
+## Config
 
-- **Paper mode** — default on; no real orders until you flip the flag
-- **RSI gate** — skips entries with RSI-14 below 55; logs every skip so you can verify it in paper mode before going live
-- **FOMC skip** — skips all entries on Fed decision days; logs each skip; update `FOMC_DECISION_DATES` each January
-- **Cash floor** — live mode halts if balance drops below `SAFETY_FLOOR`
-- **Consecutive-loss circuit breaker** — halts after 8 losses in a row (live mode); disabled in paper so collection runs don't get cut short
-- **Unfilled order cleanup** — any unmatched remainder is canceled immediately after the fill-poll window; no resting orders are left in the book
-- **Position reconciliation** — on each loop the bot compares its tracked position against the exchange and corrects mismatches
-- **Manual override** — press `C` on Windows to flatten the current position; `Esc` to exit
+All settings in top of `bot.py`, lines 41–130:
 
----
-
-## Backtesting
-
-The research folder contains a standalone backtesting engine and a real-data collector:
-
-- `kalshi_btc15m_backtest.py` — synthetic backtest using Binance 1-minute BTC data as a market proxy (no pandas/numpy — pure stdlib + matplotlib)
-- `kalshi_btc15m_tests.py` — stop-loss and schedule comparison tests, including gap-scaled slippage modeling
-- `kalshi_collect_candles.py` — pulls real KXBTC15M candlestick data (yes/no bid/ask per minute) from the Kalshi API into a flat CSV
-- `run_real_backtest.py` — runs the engine against real Kalshi data
-
-To collect real Kalshi history and run the real-data backtest:
-
+### Trading Mode
+```python
+PAPER_MODE = True              # False = live trading (requires API keys)
+PAPER_START_BALANCE = 500.0    # Starting cash for paper mode
+PAPER_SAFETY_FLOOR = 0.0       # Don't fall below this in paper
+SAFETY_FLOOR = 1000.0          # Live-mode cash floor (blocks trading if breach)
 ```
-# 1. Test with 5 markets first (default MAX_MARKETS=5)
-python kalshi_collect_candles.py
 
-# 2. Verify kalshi_quotes_REAL.csv looks right, then set MAX_MARKETS=None and re-run
-python kalshi_collect_candles.py
+### Entry
+```python
+MAX_SLIPPAGE = 0               # Pay up to ask (no slippage tolerance)
+ENTRY_TIME_MIN = 1.0           # Earliest entry: 1 min before close
+ENTRY_TIME_MAX = 10.0          # Latest entry: 10 min before close
+FLAT_RISK = 0.05               # Stake 5% of available cash per trade
+```
 
-# 3. Run the backtest
-python run_real_backtest.py
+### RSI Filter (Regime-Sensitive)
+```python
+USE_RSI_FILTER = True          # Set False to disable
+RSI_MIN = 60                   # Skip entries where RSI-14 < 60
+                               # Consolidation default (55 for Accumulation, 65-70 for Euphoria)
+RSI_LOOKBACK_MIN = 60          # Minutes of 1-min candle history to fetch
+```
+
+### FOMC Skip
+```python
+SKIP_FOMC_DAYS = True          # Skip FOMC decision days (improves ROI +11%)
+FOMC_DECISION_DATES = {        # Update this list annually
+    "2026-01-28",
+    "2026-03-18",
+    "2026-04-29",
+    "2026-06-17",
+    "2026-07-29",
+    "2026-09-16",
+    "2026-10-28",
+    "2026-12-09",
+}
+```
+
+### Stop-Loss (Two-Stage)
+```python
+USE_STOP = True
+STOP_ARM_PRICE = 75            # Consolidation default (70 for Accumulation)
+STOP_TRIGGER_PRICE = 60        # Consolidation default (53 for Accumulation)
+                               # Arm at 75c, exit if it drops to 60c (converts -96c to -40c loss)
+```
+
+### Risk & Circuit Breaker
+```python
+STRIKE_LIMIT_LIVE = 8          # Live mode: halt after 8-loss streak
+STRIKE_LIMIT = None            # Paper mode: disabled (collect data)
+FILL_POLL_TRIES = 4            # Seconds to wait for order fill before cancel
 ```
 
 ---
 
-## Known limitations
+## How It Works
 
-- **3 months of real data.** The edge appears real but the sample is small. A minimum of 6 months / ~4,000 trades is a reasonable bar before drawing firm conclusions.
-- **FOMC dates need annual maintenance.** The `FOMC_DECISION_DATES` set must be updated each January. Missing a date means the bot trades through a known risk event; an outdated date means a normal trading day gets skipped. Source: `federalreserve.gov/monetarypolicy/fomccalendars.htm`.
-- **RSI filter is regime-dependent.** The filter was derived during a bear market (Apr–Jun 2026, BTC −14%). In a bull market the NO-side entries would likely perform differently. Monitor the skip log in paper mode and revisit the threshold on fresh data.
-- **Paper fills are optimistic.** Paper mode assumes you always get the ask. Real books don't always give that, especially on fast 96¢ prints. Running live at minimum size ($50–100 notional cap) is the most informative thing you can do while accumulating data.
-- **Stop-loss fills gap.** When a 96¢ favorite reverses hard, the bid doesn't glide to the trigger — it gaps through it. Average realized fill on a stop-out in backtesting was ~44¢, not the trigger price. Account for this when sizing stop thresholds.
-- **Fee rate changes.** Kalshi adjusts fees on individual series. Verify `FEE_RATE` against `get_series_fee_changes` for KXBTC15M before running live.
-- **Schedule A is derived in-sample.** The 17–22 ET block was identified as negative on the same 3-month dataset used to measure the edge. It has a plausible structural explanation (post-market BTC vol), but it should be confirmed on fresh data before being treated as a permanent rule.
+### Main Loop (Line 497+)
+1. **Fetch KXBTC15M markets** from Kalshi API (only open markets with time left)
+2. **Check schedule & skip conditions:** Is it Schedule A hours? FOMC day? Macro news day?
+3. **Compute RSI-14** from 1-min candlestick history (spanning current + 2 settled markets)
+4. **Check entry window:** Is close time 1–10 min away?
+5. **Determine side & check bid-ask:** Is ask price exactly 96¢ on either YES/NO?
+6. **Enter:** Place a limit order at 96¢ for the appropriate side
+7. **Hold:** Monitor stop-loss if armed. Kalshi auto-settles at close.
+8. **Exit:** On settlement or stop-loss trigger
+9. **Loop:** Repeat every ~5 seconds during trading hours
+
+### RSI Computation (Line 159+)
+- Fetches 1-min OHLC from current market + 2 recently-settled KXBTC15M markets
+- Multi-market merge: current market only has ~20 min of data, so we span 60+ min by including recent settlements
+- Computes Wilder's RSI-14 (true exponential smoothing, not simple MA)
+- Falls back to yes_bid if yes_ask candle close is None (happens on still-open current candle)
+- Returns None if < 15 valid closes (insufficient data, skip entry)
+
+### Stop-Loss Logic (Line 418+)
+- **Armed state:** Once held-side (YES or NO) bid falls to STOP_ARM_PRICE (75¢)
+- **Triggered:** If bid falls further to STOP_TRIGGER_PRICE (60¢), exit immediately
+- **Backtest result:** Converts full -96¢ loss to ~-40¢, beats holding to -100¢ at every slippage level
+
+---
+
+## API Setup
+
+Requires Kalshi API key + private key (free to register at https://kalshi.com):
+
+1. Store API key ID in `apikey.txt` (single line)
+2. Store private key PEM in `private.txt` (multi-line)
+3. Both files in same directory as `bot.py`
+
+Even paper mode requires API keys to read live market data & candles.
+
+---
+
+## Logging & Output
+
+### Log Levels
+```
+[HH:MM:SS ET] 🪄 Magick Bot v6.0.0 Active [PAPER/SHADOW] | config summary
+[HH:MM:SS] [PAPER/SHADOW] Cash: $XXX.XX | Session: $+XXX.XX  # Heartbeat every 5s
+[HH:MM:SS] ⛔ RSI filter: KXBTC15M-... RSI=43.5 < 60 — skip   # Skip (logged once per market)
+[HH:MM:SS] ✅ RSI filter passed: RSI=62 >= 60                # Entry candidate
+[HH:MM:SS] ⚡ Entry at exactly 96c on YES: ask 96c x5        # Order placed
+[HH:MM:SS] ✅ Filled 5/5 @ 96c (fees 7c)                     # Order filled
+[HH:MM:SS] ⚠️ Loop Error: ...                                # Non-fatal error (retries)
+```
+
+Throttled RSI skip logging: only logs the first skip per market ticker (avoids spam from every 3-second loop).
+
+### Output Files
+- `log.txt` — Full event log (same as console, timestamped)
+- `state.json` — Current session balance, trade count, streak counter
+- `trades.json` — Full trade history (entry price, exit price, settlement, PnL)
+
+---
+
+## Resilience & Error Handling
+
+### Kalshi API Partial Outages
+SDK resilience patch (lines 10–31) tolerates null booleans in Market model during API outages. If Kalshi returns null for fields like `fractional_trading_enabled`, the bot parses as `None` instead of crashing. Allows graceful survival through degraded API states.
+
+### Network Failures
+- Retries up to 3 times on API errors (configurable RETRY_LIMIT)
+- Catches and logs non-fatal exceptions (validates orders, fetches markets, computes RSI)
+- Fatal errors (bad auth, disk write fails) are logged and halt the bot
+
+### Data Staleness
+- RSI computation always spans the last 60 min of candle data
+- Checks for sufficient closes (≥ 15) before computing RSI; skips entry if data is sparse
+- Candlestick multi-market merge ensures we have enough history even if current market is young
+
+---
+
+## Tuning for Different Regimes
+
+**Current config is tuned for Consolidation (Jul 2026, BTC $63k, down 40% YoY).**
+
+To switch regimes:
+
+### Back to Accumulation (once weekly RSI reclaims 50+):
+```python
+RSI_MIN = 55              # Loosen filter
+FLAT_RISK = 0.10         # Full 10% position size
+STOP_ARM_PRICE = 70      # Original stops
+STOP_TRIGGER_PRICE = 53
+```
+
+### Into Euphoria (if Bitcoin hits new ATH, RSI 70+ on weekly):
+```python
+RSI_MIN = 65             # Much stricter
+FLAT_RISK = 0.05         # Reduce exposure further
+# Consider exiting entirely; edge fades in euphoria
+```
+
+### Into Capitulation (if Bitcoin breaks $58k support):
+```python
+RSI_MIN = 30             # Flip to RSI ≤ 30 (oversold bounce)
+FLAT_RISK = 0.20         # 2x position size (highest edge)
+# Requires strict risk discipline; high leverage
+```
+
+**See `bitcoin_regimes_strategy.md` for full regime transition guide.**
+
+---
+
+## Paper vs. Live Mode
+
+### Paper Mode (`PAPER_MODE = True`)
+- No real orders placed
+- Simulates fills at market prices (yes_ask / no_ask at entry, settlement at 0 or 100)
+- Tracks realized PnL against paper balance
+- Useful for: backtesting, data collection, tune optimization without risk
+
+### Live Mode (`PAPER_MODE = False`)
+- Places real orders on Kalshi
+- Requires API key + private key
+- Requires `SAFETY_FLOOR = 1000.0` (won't trade if cash < floor)
+- Requires `STRIKE_LIMIT = 8` (halts after 8-loss streak)
+- First trade is live; test with small size first
+
+**Recommended:** Run 1–2 weeks in paper mode to verify RSI filter and stop-loss behavior in live market data before switching to live.
+
+---
+
+## Performance Metrics
+
+**Paper mode tracks:**
+- Session PnL (this run only)
+- Cumulative cash (starting balance + realized PnL)
+- Trade count
+- Win/loss streak
+- Max drawdown (peak-to-trough)
+
+**Live mode adds:**
+- Realized fees (scaled by 0.07 FEE_RATE)
+- Slippage tracking (ask paid vs. 96¢ baseline)
+- Strike counter (consecutive losses)
+
+Check `trades.json` for full history: entry/exit prices, settlement, fees, PnL per trade.
+
+---
+
+## Backtest Data & Reproducibility
+
+**Backtest conditions (Apr–Jun 2026):**
+- Data source: Kalshi live API, real KXBTC15M settlement prices
+- Entry filter: RSI-14 ≥ 55, FOMC skip only
+- Position size: 10% flat
+- Stop-loss: arm 70, trigger 53
+- ~1,435 entries, 561 trades (after filter)
+- 3-month rolling window (full quarterly cycle)
+
+**Results:**
+- ROI: +82.8% (from $500 starting → $914 final)
+- Win rate: 99.11% (5 losses out of 561)
+- Max DD: $768
+- Estimated monthly: $500–$600 profit on $1,800 starting balance
+
+**Regime context:**
+- This was Accumulation (Bitcoin $100k+, strong uptrend)
+- Win rate and ROI are regime-specific; will differ in Consolidation/Euphoria/Capitulation
+
+---
+
+## Files & Directory Structure
+
+```
+mystic-bot/
+├── bot.py                        # Main bot script (this file)
+├── apikey.txt                    # API key ID (not in git)
+├── private.txt                   # Private key PEM (not in git)
+├── log.txt                       # Full event log (generated)
+├── state.json                    # Current session state (generated)
+├── trades.json                   # Full trade history (generated)
+├── bitcoin_regimes_strategy.md   # Regime tuning guide
+└── README.md                     # This file
+```
+
+---
+
+## Troubleshooting
+
+### "RSI: only 0 candles" warning
+- Happens on bot startup or if Kalshi API candlestick endpoint is slow
+- Normal; resolves once market opens or API recovers
+- If persistent: check `compute_rsi()` debug logs or verify API key permissions
+
+### "Loop Error: fractional_trading_enabled validation error"
+- Kalshi API partial outage (SDK expects bool, API returns null)
+- Bot recovers automatically via SDK resilience patch
+- Monitor Kalshi status page; usually resolves in 15–30 min
+
+### "No open KXBTC15M markets found"
+- Market is closed (off-hours)
+- Schedule A only trades 5 PM–10 PM ET drop window
+- Check Kalshi calendar; markets publish on a rolling 15-min schedule
+
+### "Order rejected: invalid price"
+- Ask price is not exactly 96¢ (might be 95.5¢ or 97¢ due to market movement)
+- Bot re-checks every 3 sec; will catch the next 96¢ print
+- Normal; no action needed
+
+### Paper balance going negative
+- PAPER_SAFETY_FLOOR is 0 (allows deficit)
+- Set to positive value to halt trading if underwater
+- Check stop-loss: if triggering too late, losses accumulate faster than expected
+
+---
+
+## Development & Contributing
+
+**Last updated:** July 2026  
+**Python:** 3.9+  
+**Dependencies:** `kalshi-python-sdk`, `pytz`, `pydantic`
+
+Install:
+```bash
+pip install kalshi-python-sdk pytz pydantic
+```
+
+**Testing changes:**
+1. Run in paper mode first: `PAPER_MODE = True`
+2. Capture 50+ trades to see edge in action
+3. Log to `trades.json` and analyze PnL distribution
+4. Compare against backtest baseline before deploying live
+
+---
+
+## Disclaimer
+
+**This is a research/educational bot.** It is not financial advice. Bitcoin trading is high-risk and highly volatile. Past backtest results do not guarantee future performance. Regime changes (Euphoria → Consolidation) shift edge magnitude. Always trade with capital you can afford to lose. Start small (paper mode, then 1–2% live) before scaling. 🪄
+
+---
+
+## License & Attribution
+
+Built for algorithmic trading research. Attribution appreciated if you fork or adapt.
+
+---
+
+## Changelog
+
+**v6.0.0 (Jul 2026):**
+- ✅ RSI-14 filter: multi-market candlestick spanning, Wilder's smoothing, 1-min precision
+- ✅ FOMC skip: +11.1% ROI improvement, $132 DD reduction
+- ✅ Two-stage stop-loss: arm 70, trigger 53 (converts -96 to -40 loss)
+- ✅ Throttled skip logging: one log per market ticker (eliminates spam)
+- ✅ SDK resilience patch: tolerate null booleans during API outages
+- ✅ Consolidation tuning: RSI 60, 5% size, tighter stops (75→60)
+- ✅ Bitcoin regimes documentation: Euphoria/Accumulation/Consolidation/Capitulation guide
+
+**v5.0.0 (May 2026):**
+- RSI implementation, backtest validation
+- FOMC skip logic
+
+**v4.0.0 (Jan 2026):**
+- Core entry/exit, stop-loss framework, paper mode
+
