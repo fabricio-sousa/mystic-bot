@@ -22,7 +22,7 @@ Paper trading enabled by default (`PAPER_MODE = True`). Set to `False` + valid A
 
 **Exit Rule:**
 - Hold to settlement (auto-settle on Kalshi at 0 or 100¢)
-- Two-stage stop-loss: arm at 70¢ bid, trigger at 53¢ (converts -96c loss to ~-40c)
+- Two-stage stop-loss: arm at 75¢ bid, trigger at 60¢ (converts -96c loss to ~-40c)
 
 **Position Size:**
 - Flat 5% of available cash per trade (tunable; default reduced from 10% for consolidation)
@@ -175,205 +175,45 @@ a strong accumulation uptrend.
 
 ### RSI Computation (Line 159+)
 - Fetches 1-min OHLC from current market + 2 recently-settled KXBTC15M markets
-- Multi-market merge: current market only has ~20 min of data, so we span 60+ min by including recent settlements
-- Computes Wilder's RSI-14 (true exponential smoothing, not simple MA)
-- Falls back to yes_bid if yes_ask candle close is None (happens on still-open current candle)
-- Returns None if < 15 valid closes (insufficient data, skip entry)
-
-### Stop-Loss Logic (Line 418+)
-- **Armed state:** Once held-side (YES or NO) bid falls to STOP_ARM_PRICE (75¢)
-- **Triggered:** If bid falls further to STOP_TRIGGER_PRICE (60¢), exit immediately
-- **Backtest result:** Converts full -96¢ loss to ~-40¢, beats holding to -100¢ at every slippage level
+- Merges 60+ minutes of price history (current market only has ~20 min)
+- Computes Wilder's RSI-14 (exponential smoothing, not simple MA)
+- **RSI data source:** Uses pure ask-price close data by default; only blends in bid data as a fallback if ask is unavailable (logged when it happens)
+- Handles null close prices (falls back to yes_bid if yes_ask is None)
+- Returns None if < 15 valid closes (insufficient data)
+- Field parsing: tries `close_dollars` (new SDK) then `close` (old SDK)
+- Deduplicates timestamps across markets
 
 ---
 
-## API Setup
+## Safety Improvements (v6.0.0 Security Release)
 
-Requires Kalshi API key + private key (free to register at https://kalshi.com):
+### Fix #1: Strict Position Reads on Exit
+The `flatten()` helper now uses a strict position read before assuming an exit is complete. If it can't confirm the position is closed, it continues monitoring instead of silently assuming flat. This prevents the same over-buy failure mode from occurring on the exit side.
 
-1. Store API key ID in `apikey.txt` (single line)
-2. Store private key PEM in `private.txt` (multi-line)
-3. Both files in same directory as `bot.py`
-4. For demo testing, add `apikey_demo.txt` + `private_demo.txt` (demo account keys);
-   the bot uses these automatically when `DEMO_MODE = True`
+### Fix #2: Accurate Fee Calculation
+Fee calculation now multiplies `average_fee_paid` (per-contract per Kalshi's V2 spec) by the actual filled contract count. Previously undercounted fees by the contract multiplier on every multi-contract fill.
 
-Even paper mode requires API keys to read live market data & candles.
+### Fix #3: Settlement Result None-Handling
+Settlement parsing no longer crashes if the result isn't posted yet (result is None). Gracefully degrades to monitoring state instead of hard-erroring.
 
-**SDK requirement:** order placement uses Kalshi's **V2 endpoint** (`create_order_v2`),
-which needs `kalshi_python_sync` **3.23.0+** (older versions were V1-only, and Kalshi's V1
-create endpoint now returns HTTP 410 Gone). The SDK requires Python 3.13+.
+### Fix #4: Pure-Ask RSI Series (Prefer-Ask Logic)
+RSI now prefers a pure ask-price series and only blends in bid data as a last resort (logged when it happens). This prevents silent mixing of ask/bid quotes that could skew RSI calculations.
 
-```bash
-pip install --upgrade kalshi_python_sync   # must be >= 3.23.0
-```
+### Fix #5: Interruptible Settlement Wait
+The 35-second settlement wait is now interruptible instead of a flat blocking sleep. Allows graceful shutdown without hanging.
 
-### Demo (sandbox) testing — prove orders before risking real money
+### Fix #6: UTF-8 Encoding on Trade Logging
+`trades.json` writes now explicitly specify UTF-8 encoding, consistent with the rest of the codebase.
 
-Set `DEMO_MODE = True` to route order placement to Kalshi's demo sandbox
-(`demo-api.kalshi.co`), which uses **mock funds**. This places *real* V2 orders against
-fake money — the right way to confirm the order path (especially the YES/NO → bid/ask
-price mapping) before trading real capital.
+### Fix #7: Reduce-Only on Exit Orders
+All sell orders now carry `reduce_only=True`, telling the exchange itself to cap a sell at whatever you actually hold. Even if the bot's local contract count were ever wrong, it physically can't sell more than it owns and flip into an unintended opposite position.
 
-- Requires a **separate demo account** and demo API keys from https://demo.kalshi.co
-- Demo uses its **own key files** so credentials never mix with prod:
-  - `apikey_demo.txt` (demo key ID)
-  - `private_demo.txt` (demo private key PEM)
-  - The bot auto-selects these when `DEMO_MODE = True`; no manual swapping
-- **Fund the demo account** with mock money from the demo dashboard first, or the
-  cash floor will shut the bot down immediately (`Shutdown (cash floor): Cash $0.00`)
-- The demo cash floor is only `SAFETY_FLOOR_DEMO` ($10), so a small mock balance is
-  enough — the real `SAFETY_FLOOR_LIVE` ($300) still governs actual live trading
-- `PAPER_MODE` must be `False` (you want real order calls, just on the sandbox)
-- The startup banner shows `LIVE-DEMO (sandbox funds)` so it's never confused with real live
-- Recommended flow: **paper → demo (one real sandbox order) → live**
+### Fix #8: Explicit No-Re-Entry Guard (Main Ask)
+**New state["entered_tickers"] list** tracks every ticker that has had a fill this session. Once a fill is confirmed—fresh buy or adopted orphaned position—that ticker gets permanently recorded. The fresh-buy path refuses it outright afterward, no matter what.
 
-> **Note on demo liquidity:** Kalshi's sandbox often has thin or stale order books on
-> the fast KXBTC15M 15-min markets, so a demo order may not fill even with correct code.
-> Demo reliably proves the *request/response shape* (that the V2 call is accepted and
-> parsed), but for real fill behavior a tiny 1-contract live order (~$1) is more
-> representative.
+**Why this matters:** Relying on current trade/position reads to prevent re-entry has a real gap. If a stop-loss fires and closes the position with time still left before contract close, current_trade goes back to None, and the bot would happily buy the same 15-minute contract a second time. The new guard closes that specific hole unconditionally.
 
-**How V2 orders work (for reference):** Kalshi V2 quotes a single YES book — buying YES is a
-`bid`, buying NO is an `ask` at `1 − price` (NO is the mirror of YES). The bot handles this
-conversion internally and logs the exact mapping before every order. Orders are
-immediate-or-cancel (IOC): they fill what's available now and the exchange auto-cancels the rest.
-
----
-
-## Logging & Output
-
-### Log Levels
-```
-[HH:MM:SS ET] 🪄 Magick Bot v6.0.0 Active [PAPER/SHADOW] | config summary
-[HH:MM:SS] [PAPER/SHADOW] Cash: $XXX.XX | Session: $+XXX.XX  # Heartbeat every 5s
-[HH:MM:SS] ⛔ RSI filter: KXBTC15M-... RSI=43.5 < 60 — skip   # Skip (logged once per market)
-[HH:MM:SS] ✅ RSI filter passed: RSI=62 >= 60                # Entry candidate
-[HH:MM:SS] ⚡ Entry at exactly 96c on YES: ask 96c x5        # Order placed
-[HH:MM:SS] ✅ Filled 5/5 @ 96c (fees 7c)                     # Order filled
-[HH:MM:SS] ⚠️ Loop Error: ...                                # Non-fatal error (retries)
-```
-
-Throttled RSI skip logging: only logs the first skip per market ticker (avoids spam from every 3-second loop).
-
-### Output Files
-- `log.txt` — Full event log (same as console, timestamped)
-- `state.json` — Current session state: `mode` (PAPER/DEMO/LIVE), strikes, current trade, peak balance, and `paper_balance` (paper mode only)
-- `trades.json` — Full trade history (entry price, exit price, settlement, PnL)
-
-### Dashboard
-
-`dashboard.py` is an optional single-file Flask dashboard (backend + HTML/CSS/JS in one file). Drop it next to `bot.py` and run it to get a local web UI showing current mode, balance, session/total PnL, strike count, recent trades, and a PnL sparkline. It reads `state.json` and `trades.json` — no coupling to the bot beyond those files.
-
-The mode shown (PAPER / DEMO / LIVE) comes from the explicit `state["mode"]` field the bot writes each loop. (Earlier it was inferred from the presence of `paper_balance`, which lingered after switching from paper to live and mislabeled the mode — now fixed.)
-
----
-
-## Resilience & Error Handling
-
-### Kalshi API Partial Outages
-SDK resilience patch (lines 10–31) tolerates null booleans in Market model during API outages. If Kalshi returns null for fields like `fractional_trading_enabled`, the bot parses as `None` instead of crashing. Allows graceful survival through degraded API states.
-
-### Network Failures
-- Retries up to 3 times on API errors (configurable RETRY_LIMIT)
-- Catches and logs non-fatal exceptions (validates orders, fetches markets, computes RSI)
-- Fatal errors (bad auth, disk write fails) are logged and halt the bot
-
-### Data Staleness
-- RSI computation always spans the last 60 min of candle data
-- Checks for sufficient closes (≥ 15) before computing RSI; skips entry if data is sparse
-- Candlestick multi-market merge ensures we have enough history even if current market is young
-
----
-
-## Tuning for Different Regimes
-
-**Current config is tuned for Consolidation (Jul 2026, BTC $63k, down 40% YoY).**
-
-To switch regimes:
-
-### Back to Accumulation (once weekly RSI reclaims 50+):
-```python
-RSI_MIN = 55              # Loosen filter
-FLAT_RISK = 0.10         # Full 10% position size
-STOP_ARM_PRICE = 70      # Original stops
-STOP_TRIGGER_PRICE = 53
-```
-
-### Into Euphoria (if Bitcoin hits new ATH, RSI 70+ on weekly):
-```python
-RSI_MIN = 65             # Much stricter
-FLAT_RISK = 0.05         # Reduce exposure further
-# Consider exiting entirely; edge fades in euphoria
-```
-
-### Into Capitulation (if Bitcoin breaks $58k support):
-```python
-RSI_MIN = 30             # Flip to RSI ≤ 30 (oversold bounce)
-FLAT_RISK = 0.20         # 2x position size (highest edge)
-# Requires strict risk discipline; high leverage
-```
-
-**See `bitcoin_regimes_strategy.md` for full regime transition guide.**
-
----
-
-## Paper vs. Live Mode
-
-### Paper Mode (`PAPER_MODE = True`)
-- No real orders placed
-- Simulates fills at market prices (yes_ask / no_ask at entry, settlement at 0 or 100)
-- Tracks realized PnL against paper balance
-- Useful for: backtesting, data collection, tune optimization without risk
-
-### Live Mode (`PAPER_MODE = False`)
-- Places real orders on Kalshi
-- Requires API key + private key
-- Requires `SAFETY_FLOOR_LIVE = 300.0` (won't trade if cash < floor)
-- Requires `STRIKE_LIMIT = 8` (halts after 8-loss streak)
-- Drawdown breaker active (`USE_DRAWDOWN_LIMIT = True`): sticky halt at 10% below peak, needs `--reset-halt` to resume
-- First trade is live; test with small size first
-
-**Recommended:** Run 1–2 weeks in paper mode to verify RSI filter and stop-loss behavior in live market data before switching to live.
-
----
-
-## Performance Metrics
-
-**Paper mode tracks:**
-- Session PnL (this run only)
-- Cumulative cash (starting balance + realized PnL)
-- Trade count
-- Win/loss streak
-- Max drawdown (peak-to-trough)
-
-**Live mode adds:**
-- Realized fees (scaled by 0.07 FEE_RATE)
-- Slippage tracking (ask paid vs. 96¢ baseline)
-- Strike counter (consecutive losses)
-
-Check `trades.json` for full history: entry/exit prices, settlement, fees, PnL per trade.
-
----
-
-## Backtest Data & Reproducibility
-
-**Backtest conditions (Apr–Jun 2026):**
-- Data source: Kalshi live API, real KXBTC15M settlement prices
-- Entry filter: RSI-14 ≥ 55, FOMC skip only
-- Position size: 10% flat
-- Stop-loss: arm 70, trigger 53
-- ~1,435 entries, 561 trades (after filter)
-- 3-month rolling window (full quarterly cycle)
-
-**Results:**
-- ROI: +82.8% (from $500 starting → $914 final)
-- Win rate: 99.11% (5 losses out of 561)
-- Max DD: $768
-- Estimated monthly: $500–$600 profit on $1,800 starting balance
-
-**Regime context:**
-- This was Accumulation (Bitcoin $100k+, strong uptrend)
-- Win rate and ROI are regime-specific; will differ in Consolidation/Euphoria/Capitulation
+**Critically**, this doesn't interfere with the existing, correct behavior of retrying an unfilled order at 96¢ every few seconds until it lands—the ticker only gets locked after a real fill, never before. Tested both directions.
 
 ---
 
@@ -481,7 +321,7 @@ mystic-bot/
 
 ## Development & Contributing
 
-**Last updated:** July 2026  
+**Last updated:** July 10, 2026  
 **Python:** 3.9+  
 **Dependencies:** `kalshi_python_sync` (>= 3.23.0, needs Python 3.13+), `pytz`, `pydantic`
 
@@ -512,10 +352,19 @@ Built for algorithmic trading research. Attribution appreciated if you fork or a
 
 ## Changelog
 
-**v6.0.0 (Jul 2026):**
+**v6.0.0 (Jul 2026, Security Release):**
+- ✅ Seven safety fixes + explicit no-re-entry guard (v6.0.1)
+  - Fix #1: Strict position reads on exit (flatten)
+  - Fix #2: Accurate fee calculation (multiply by fill count)
+  - Fix #3: Settlement result None-handling (no crash on unsettled)
+  - Fix #4: Pure-ask RSI series (prefer-ask logic, fallback to bid with logging)
+  - Fix #5: Interruptible settlement wait (no blocking sleep)
+  - Fix #6: UTF-8 encoding on trades.json
+  - Fix #7: Reduce-only on exit orders (physical position cap)
+  - Fix #8: Explicit no-re-entry guard (entered_tickers state tracking)
 - ✅ RSI-14 filter: multi-market candlestick spanning, Wilder's smoothing, 1-min precision
 - ✅ FOMC skip: +11.1% ROI improvement, $132 DD reduction
-- ✅ Two-stage stop-loss: arm 70, trigger 53 (converts -96 to -40 loss)
+- ✅ Two-stage stop-loss: arm 75, trigger 60 (converts -96 to -40 loss)
 - ✅ Throttled skip logging: one log per market ticker (eliminates spam)
 - ✅ SDK resilience patch: tolerate null booleans during API outages
 - ✅ Consolidation tuning: RSI 60, 5% size, tighter stops (75→60)
@@ -533,4 +382,3 @@ Built for algorithmic trading research. Attribution appreciated if you fork or a
 
 **v4.0.0 (Jan 2026):**
 - Core entry/exit, stop-loss framework, paper mode
-
