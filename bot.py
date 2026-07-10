@@ -41,8 +41,23 @@ except ImportError:
 
 # ====================== CONFIG ======================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-APIKEY_FILE = os.path.join(BASE_DIR, "apikey.txt")
-PRIVATE_FILE = os.path.join(BASE_DIR, "private.txt")
+
+# --- Environment: prod vs demo sandbox ---
+# DEMO_MODE routes live order placement to Kalshi's SANDBOX (demo) exchange, which
+# uses mock funds — real V2 orders, fake money. Use this to prove the V2 order path
+# (especially the bid/ask + NO-price-inversion mapping) end-to-end before trading
+# real capital. Requires a SEPARATE demo account + demo API keys from demo.kalshi.co.
+# When True, PAPER_MODE must be False (you want real order calls, just on the sandbox).
+# NOTE: defined here (before the key-file paths) because those paths depend on it.
+DEMO_MODE = False              # True = place real orders against the demo sandbox host.
+PROD_HOST = "https://api.elections.kalshi.com/trade-api/v2"
+DEMO_HOST = "https://demo-api.kalshi.co/trade-api/v2"
+
+# Demo and prod are SEPARATE accounts with SEPARATE API keys. Keep two key-file sets
+# so credentials never mix: drop demo keys into apikey_demo.txt / private_demo.txt.
+# The correct set is auto-selected by DEMO_MODE — no manual swapping.
+APIKEY_FILE  = os.path.join(BASE_DIR, "apikey_demo.txt"  if DEMO_MODE else "apikey.txt")
+PRIVATE_FILE = os.path.join(BASE_DIR, "private_demo.txt" if DEMO_MODE else "private.txt")
 LOG_FILE = os.path.join(BASE_DIR, "log.txt")
 STATE_FILE = os.path.join(BASE_DIR, "state.json")
 TRADES_FILE = os.path.join(BASE_DIR, "trades.json")
@@ -52,16 +67,7 @@ PAPER_MODE = False              # Shadow/paper trading. No real orders are place
 PAPER_START_BALANCE = 500.0   # Simulated starting cash; moves with realized PnL.
 PAPER_SAFETY_FLOOR = 0.0       # Paper floor (live SAFETY_FLOOR would block trading from $1000).
 
-# DEMO_MODE routes live order placement to Kalshi's SANDBOX (demo) exchange, which
-# uses mock funds — real V2 orders, fake money. Use this to prove the V2 order path
-# (especially the bid/ask + NO-price-inversion mapping) end-to-end before trading
-# real capital. Requires a SEPARATE demo account + demo API keys from demo.kalshi.co.
-# When True, PAPER_MODE must be False (you want real order calls, just on the sandbox).
-DEMO_MODE = False              # True = place real orders against the demo sandbox host.
-PROD_HOST = "https://api.elections.kalshi.com/trade-api/v2"
-DEMO_HOST = "https://demo-api.kalshi.co/trade-api/v2"
-
-FLAT_RISK = 0.15               
+FLAT_RISK = 0.05               
 MAX_POSITION_DOLLARS = 500.0
 FEE_RATE = 0.07                # Kalshi trading-fee rate for paper/sim PnL. VERIFY against the
                                # current KXBTC15M schedule (get_series_fee_changes); fees change.
@@ -118,7 +124,12 @@ STOP_ARM_PRICE = 75            # Only used if USE_STOP=True. Begin monitoring on
 STOP_TRIGGER_PRICE = 60        # Only used if USE_STOP=True. Exit once armed & bid <= this.
 
 # --- Risk rails ---
-SAFETY_FLOOR = 300.0          # Live-mode cash floor.
+# Live cash floor: the bot won't open trades if settled cash is below this. On the
+# demo sandbox we drop it to a token amount so testing doesn't require a large mock
+# balance — the real protective floor still applies to actual live trading.
+SAFETY_FLOOR_LIVE = 300.0     # Real live-mode cash floor.
+SAFETY_FLOOR_DEMO = 10.0      # Sandbox floor (mock funds); keeps demo runnable on a small balance.
+SAFETY_FLOOR = SAFETY_FLOOR_DEMO if DEMO_MODE else SAFETY_FLOOR_LIVE
 # --- Consecutive-loss circuit breaker ---
 # Counts LOSING STREAKS (reset to 0 on any win), not total losses. Halts the bot
 # when the streak reaches the limit. At a ~55% win rate a 3-loss streak is normal
