@@ -268,10 +268,16 @@ def compute_rsi(current_ticker):
             period_interval = 1,
         )
 
-        # 3. Merge, using yes_ask close with yes_bid close as fallback.
-        # Kalshi migrated live candlestick OHLC to *_dollars string fields
-        # (e.g. "0.5600"); older SDK builds exposed a bare `close` in cents.
-        # Read close_dollars first, fall back to close, so this works either way.
+        # 3. Prefer a PURE ask-price series. Mixing ask and bid quotes within one
+        # series introduces artificial jumps (the bid-ask spread) that distort the
+        # Wilder RSI computation. Only fall back to blending in bid-based closes
+        # (for the rare candle missing a firm ask — typically the still-forming
+        # candle of the current open market) if the pure-ask series doesn't reach
+        # the 15-close minimum on its own. This keeps the common case clean and
+        # only accepts the noisier blended series as a last resort, logged so it's
+        # auditable. Kalshi migrated live candlestick OHLC to *_dollars string
+        # fields (e.g. "0.5600"); older SDK builds exposed a bare `close` in
+        # cents. Read close_dollars first, fall back to close, so this works either way.
         def _close(side_obj):
             if side_obj is None:
                 return None
@@ -280,9 +286,18 @@ def compute_rsi(current_ticker):
                 v = getattr(side_obj, "close", None)
             return v
 
+        def _dedup_sorted(pairs):
+            pairs = sorted(pairs, key=lambda x: x[0])
+            seen, out = set(), []
+            for ts, v in pairs:
+                if ts not in seen:
+                    seen.add(ts); out.append(v)
+            return out
+
         mkts = getattr(batch, "markets", []) or []
         raw = 0                                   # total candle rows returned
-        all_candles = []
+        ask_candles = []
+        bid_fallback_candles = []
         for mkt in mkts:
             cs = getattr(mkt, "candlesticks", []) or []
             raw += len(cs)
@@ -290,18 +305,22 @@ def compute_rsi(current_ticker):
                 ts = getattr(c, "end_period_ts", None)
                 if ts is None:
                     continue
-                v = _close(getattr(c, "yes_ask", None))
-                if v is None:                        # fallback: yes_bid
-                    v = _close(getattr(c, "yes_bid", None))
-                if v is not None:
-                    all_candles.append((ts, float(v)))
+                v_ask = _close(getattr(c, "yes_ask", None))
+                if v_ask is not None:
+                    ask_candles.append((ts, float(v_ask)))
+                else:
+                    v_bid = _close(getattr(c, "yes_bid", None))
+                    if v_bid is not None:
+                        bid_fallback_candles.append((ts, float(v_bid)))
 
-        # 4. Sort and deduplicate
-        all_candles.sort(key=lambda x: x[0])
-        seen, closes = set(), []
-        for ts, v in all_candles:
-            if ts not in seen:
-                seen.add(ts); closes.append(v)
+        # 4. Sort, dedupe. Use pure-ask if it's enough; otherwise blend.
+        closes = _dedup_sorted(ask_candles)
+        if len(closes) < 15 and bid_fallback_candles:
+            pure_count = len(closes)
+            closes = _dedup_sorted(ask_candles + bid_fallback_candles)
+            log(f"⚠️ RSI: pure-ask series had only {pure_count} closes — blended in "
+                f"{len(bid_fallback_candles)} bid-fallback point(s) to reach {len(closes)} "
+                f"(accepting some ask/bid basis noise to avoid starving the window)")
 
         if len(closes) < 15:
             log(f"⚠️ RSI: {len(closes)} usable / {raw} raw candles across "
@@ -335,15 +354,31 @@ def load_state():
 def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f: json.dump(state, f, indent=2)
 
+def interruptible_sleep(total_seconds, chunk=1.0):
+    """Sleep in small chunks, staying responsive to the keyboard override/exit
+    during long waits (e.g. the settlement-finalization pause) instead of one
+    flat, unresponsive time.sleep(). ESC exits immediately; 'c' sets the same
+    OVERRIDE_TRIGGERED flag the main loop checks, so the pending flatten runs
+    as soon as this wait ends rather than being silently delayed."""
+    global OVERRIDE_TRIGGERED
+    elapsed = 0.0
+    while elapsed < total_seconds:
+        if HAS_WINDOWS and msvcrt.kbhit():
+            key = msvcrt.getch()
+            if key == b'\x1b': os._exit(0)
+            elif key.lower() == b'c': OVERRIDE_TRIGGERED = True
+        time.sleep(min(chunk, total_seconds - elapsed))
+        elapsed += chunk
+
 def update_trades_json(trade_entry):
     trades = []
     trade_entry["category"] = "paper" if PAPER_MODE else "bot"
     if os.path.exists(TRADES_FILE):
-        with open(TRADES_FILE, "r") as f:
+        with open(TRADES_FILE, "r", encoding="utf-8") as f:
             try: trades = json.load(f)
             except: trades = []
     trades.append(trade_entry)
-    with open(TRADES_FILE, "w") as f: json.dump(trades, f, indent=2)
+    with open(TRADES_FILE, "w", encoding="utf-8") as f: json.dump(trades, f, indent=2)
 
 def safe_price_cents(value) -> int:
     try: return int(round(float(value or 0) * 100))
@@ -360,6 +395,29 @@ def apply_pnl(state, pnl):
     SESSION_PNL += pnl
     if PAPER_MODE:
         state["paper_balance"] = round(state.get("paper_balance", PAPER_START_BALANCE) + pnl, 2)
+
+def mark_ticker_entered(state, ticker):
+    """Record a CONFIRMED fill (fresh buy or adopted position) on `ticker`.
+
+    This backs an unconditional "never buy this ticker again this session" guard,
+    independent of get_exchange_position, current_trade, or any other read
+    succeeding. It closes a gap that a purely fill/position-based guard doesn't:
+    e.g. stop-loss exits a position with time still left before close, and
+    `current_trade` goes back to None — without this, the entry gate would happily
+    re-enter the SAME 15-min contract a second time. Once a ticker is in this set,
+    the fresh-buy path refuses it outright, however many times the loop runs.
+
+    Does NOT gate the unfilled-order retry loop: this is only called after a
+    confirmed fill (filled > 0), so the normal "keep trying at 96c until it lands"
+    behavior for an order that hasn't filled yet is untouched.
+
+    Bounded to the most recent 200 tickers — each KXBTC15M contract only exists
+    for ~20 minutes and is never reused, so 200 comfortably covers 48+ hours of
+    history without the list growing unbounded over a long-running session."""
+    et = state.get("entered_tickers", [])
+    if ticker not in et:
+        et.append(ticker)
+    state["entered_tickers"] = et[-200:]
 
 def update_peak_balance(state, balance):
     """Track the high-water mark of settled balance for the drawdown circuit breaker.
@@ -531,7 +589,11 @@ def place_order(ticker, side, count, action, price_cents):
         # IOC: fill what's available at/through our price NOW, auto-cancel the rest
         # server-side. This preserves the old "marketable then cancel remainder"
         # behavior in one call, so no separate (now-removed) cancel_order is needed.
-        resp = client.create_order_v2(
+        # reduce_only=True on SELLS is an extra independent safety net: it tells the
+        # exchange itself to cap the sell at whatever we actually hold, so even if our
+        # locally-tracked count were ever stale/wrong, we can never accidentally sell
+        # MORE than we own and flip into an unintended opposite position.
+        order_kwargs = dict(
             ticker=ticker,
             client_order_id=order_id,
             side=book_side,
@@ -540,6 +602,9 @@ def place_order(ticker, side, count, action, price_cents):
             time_in_force="immediate_or_cancel",
             self_trade_prevention_type="taker_at_cross",
         )
+        if action == "sell":
+            order_kwargs["reduce_only"] = True
+        resp = client.create_order_v2(**order_kwargs)
     except Exception as e:
         log(f"❌ Order submit error (V2): {e}")
         return blank
@@ -555,8 +620,15 @@ def place_order(ticker, side, count, action, price_cents):
     filled = int(_num(getattr(resp, "fill_count", 0)))
     remaining = int(_num(getattr(resp, "remaining_count", count)))
 
-    # average_fee_paid is fixed-point dollars for the WHOLE order -> convert to cents.
-    fees = int(round(_num(getattr(resp, "average_fee_paid", 0)) * 100))
+    # Kalshi's V2 spec: average_fee_paid is the volume-weighted average fee PAID
+    # PER CONTRACT (same convention as average_fill_price), not the order total.
+    # Must multiply by filled count to get the total fee. (Confirmed against
+    # docs.kalshi.com/api-reference/orders/create-order-v2 — CreateOrderV2Response
+    # schema: "Volume-weighted average fee paid per contract for fills resulting
+    # from this request.") Getting this wrong silently understates fees/overstates
+    # PnL by ~filled-count-fold on any multi-contract order.
+    per_contract_fee_cents = _num(getattr(resp, "average_fee_paid", 0)) * 100.0
+    fees = int(round(per_contract_fee_cents * filled))
 
     avg = None
     if filled > 0:
@@ -602,7 +674,16 @@ def flatten(curr, reason, trade_type):
 
     if PAPER_MODE:
         return True, pnl  # paper sells fill fully
-    remaining_pos = abs(get_exchange_position(curr['ticker']))
+
+    try:
+        remaining_pos = abs(get_exchange_position(curr['ticker'], strict=True))
+    except PositionUnknown as pe:
+        # Do NOT assume flat on a read failure — that's the exact bug class that
+        # caused the over-buy. Leave curr/count untouched and report "not cleared"
+        # so the caller keeps tracking/monitoring it and retries next loop.
+        log(f"⚠️ {reason}: can't confirm remaining position after sell attempt "
+            f"({pe}) — NOT marking cleared, will re-check next loop")
+        return False, pnl
     if remaining_pos == 0:
         return True, pnl
     curr['count'] = remaining_pos  # partial: keep tracking remainder
@@ -785,8 +866,11 @@ if __name__ == "__main__":
             # --- SETTLEMENT CHECK ---
             if curr and market.ticker != curr["ticker"]:
                 log(f"⏳ Finalizing {curr['ticker']}...")
-                time.sleep(35)
-                res = getattr(client.get_market(curr['ticker']).market, 'result', '').lower()
+                interruptible_sleep(35)  # stays responsive to ESC/override during the wait
+                # getattr's default only applies if the attribute is MISSING — before
+                # settlement `result` exists but is None, so the old bare `or` was
+                # needed here: getattr(...,'result',None) or '' avoids .lower() on None.
+                res = (getattr(client.get_market(curr['ticker']).market, 'result', None) or '').lower()
                 if res in ['yes', 'no']:
                     won = (curr['side'] == res)
                     entry_fees = curr.get("entry_fees_cents", 0) / 100.0
@@ -821,8 +905,18 @@ if __name__ == "__main__":
                         state["current_trade"] = {"ticker": market.ticker, "side": ex_side,
                             "count": abs(existing), "entry_price_cents": avg,
                             "status": "filled", "entry_fees_cents": 0, "stop_armed": False}
+                        mark_ticker_entered(state, market.ticker)
                         save_state(state)
                     else:
+                        # Unconditional "already traded this ticker this session" guard.
+                        # Independent of get_exchange_position/current_trade — even if a
+                        # stop-loss exit already closed this position earlier with time
+                        # still left in the window, we never buy it again. See
+                        # mark_ticker_entered() for why this is needed on top of the
+                        # position cap / current_trade tracking.
+                        if market.ticker in state.get("entered_tickers", []):
+                            log(f"🔒 Already traded {market.ticker} this session — no re-entry")
+                            time.sleep(3); continue
                         side = None
                         ask_price = None
                         if y_ask == 96:
@@ -889,6 +983,7 @@ if __name__ == "__main__":
                                     "count": res["filled"], "entry_price_cents": entry_p,
                                     "status": "filled", "entry_fees_cents": res["fees_cents"],
                                     "stop_armed": False}
+                                mark_ticker_entered(state, market.ticker)
                                 save_state(state); play_sound("buy")
                                 log(f"✅ Filled {res['filled']}/{qty} @ {entry_p}c (fees {res['fees_cents']}c)")
                                 time.sleep(5)
