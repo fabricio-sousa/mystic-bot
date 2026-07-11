@@ -217,6 +217,39 @@ All sell orders now carry `reduce_only=True`, telling the exchange itself to cap
 
 ---
 
+## Data & Telemetry: `rsi_at_entry` (v6.0.2)
+
+Every trade record in `trades.json` now carries the RSI-14 value that was live at the
+moment of entry, under `"rsi_at_entry"`. This closes a real analysis gap: previously
+`trades.json` recorded *that* a trade happened but not *why* — you couldn't tell which
+of your live trades cleared RSI 55 vs. 60 vs. some other value without re-deriving it
+from scratch. Now every future trade is self-documenting.
+
+**Behavior:**
+- **Fresh 96¢ entries (RSI filter on):** `rsi_at_entry` is the exact RSI-14 reading
+  that passed the `RSI_MIN` gate — the same value logged to `log.txt` at entry.
+- **Fresh 96¢ entries (RSI filter off, `USE_RSI_FILTER=False`):** `rsi_at_entry` is
+  `null`. The filter never ran, so there's no reading to attach.
+- **Adopted/orphaned positions** (an untracked exchange position the bot picks up on
+  restart): `rsi_at_entry` is `null`. No RSI-gated entry decision was made for these —
+  the position already existed — so there's nothing honest to record.
+- Recorded on **every** exit type that writes to `trades.json`: `SETTLEMENT`,
+  `STOP_LOSS`, and `MANUAL_FLATTEN` all carry the RSI value from the trade's original
+  entry, not the exit.
+- **Backward compatible:** old trade records written before this update simply don't
+  have the key. Anything reading `trades.json` should use `.get("rsi_at_entry")`
+  rather than direct indexing.
+
+**Why this matters:** every RSI-threshold backtest so far — including the real-data
+verification runs — has had to reconstruct RSI after the fact from raw price/quote
+history, which is slow and methodology-sensitive (see the real-vs-modeled quote
+discussion above). Live trades now settle that debate directly: after enough trades
+accumulate, you can filter `trades.json` by `rsi_at_entry >= 55` vs. `>= 60` and get
+a real, no-reconstruction-needed answer for your specific bot, on your specific
+schedule, at whatever position size was actually running at the time.
+
+---
+
 ## Files & Directory Structure
 
 ```
@@ -229,7 +262,7 @@ mystic-bot/
 ├── private_demo.txt              # Demo private key PEM — used when DEMO_MODE=True (not in git)
 ├── log.txt                       # Full event log (generated)
 ├── state.json                    # Current session state incl. mode field (generated)
-├── trades.json                   # Full trade history (generated)
+├── trades.json                   # Full trade history incl. rsi_at_entry (generated)
 ├── bitcoin_regimes_strategy.md   # Regime tuning guide
 ├── Mystic-Bot.md                 # Development log / memory dump
 └── README.md                     # This file
@@ -351,6 +384,14 @@ Built for algorithmic trading research. Attribution appreciated if you fork or a
 ---
 
 ## Changelog
+
+**v6.0.2 (Jul 2026, Telemetry):**
+- ✅ `rsi_at_entry` field added to every `trades.json` record (settlement, stop-loss,
+  manual flatten) — the live RSI-14 reading at entry, so RSI-threshold questions can
+  be answered directly from live trade history instead of reconstructed after the fact
+- ✅ `null` for adopted/orphaned positions and for entries made with `USE_RSI_FILTER=False`
+  (no RSI-gated decision was made in either case)
+- ✅ Backward compatible — pre-update trade records simply lack the key
 
 **v6.0.0 (Jul 2026, Security Release):**
 - ✅ Seven safety fixes + explicit no-re-entry guard (v6.0.1)
