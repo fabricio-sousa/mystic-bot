@@ -667,7 +667,8 @@ def flatten(curr, reason, trade_type):
             "ticker": curr['ticker'], "side": curr['side'],
             "count": res["filled"], "entry_price_cents": curr.get("entry_price_cents"),
             "exit_price_cents": exit_p,
-            "pnl": round(pnl, 2), "type": trade_type})
+            "pnl": round(pnl, 2), "type": trade_type,
+            "rsi_at_entry": curr.get("rsi_at_entry")})
         log(f"{reason}: sold {res['filled']} @ ~{exit_p}c | PnL ${pnl:+.2f}")
     else:
         log(f"⚠️ {reason}: sell unfilled (remainder canceled) — will retry next loop")
@@ -882,7 +883,8 @@ if __name__ == "__main__":
                         "ticker": curr['ticker'], "side": curr['side'],
                         "count": curr.get("count"), "entry_price_cents": curr.get("entry_price_cents"),
                         "exit_price_cents": 100 if won else 0,
-                        "pnl": round(pnl, 2), "type": "SETTLEMENT"})
+                        "pnl": round(pnl, 2), "type": "SETTLEMENT",
+                        "rsi_at_entry": curr.get("rsi_at_entry")})
                     apply_pnl(state, pnl)
                     log(f"🏁 RESULT: {res.upper()} | {'WIN' if won else 'LOSS'} | PnL: ${pnl:+.2f}")
                     state["strikes"] = 0 if won else state.get("strikes", 0) + 1
@@ -904,7 +906,10 @@ if __name__ == "__main__":
                         log(f"🔧 Adopting untracked position: {market.ticker} {ex_side.upper()} x{abs(existing)} @ ~{avg}c")
                         state["current_trade"] = {"ticker": market.ticker, "side": ex_side,
                             "count": abs(existing), "entry_price_cents": avg,
-                            "status": "filled", "entry_fees_cents": 0, "stop_armed": False}
+                            "status": "filled", "entry_fees_cents": 0, "stop_armed": False,
+                            # unknown — this is an adopted/orphaned position, not a fresh
+                            # RSI-gated entry, so there's no RSI reading to attach to it.
+                            "rsi_at_entry": None}
                         mark_ticker_entered(state, market.ticker)
                         save_state(state)
                     else:
@@ -938,6 +943,12 @@ if __name__ == "__main__":
                         # time (overwhelmingly NO-side in a bear trend), far below the
                         # 96.27% breakeven. compute_rsi() returns None on fetch failure;
                         # treat None as a skip to avoid trading blind.
+                        # `rsi` is initialized here (not just inside the filter branch) so
+                        # it's always defined when we build current_trade below — recorded
+                        # on every trade as rsi_at_entry regardless of USE_RSI_FILTER, so
+                        # trades.json carries the value that was live at entry. None means
+                        # either the filter was off or (for adopted positions below) unknown.
+                        rsi = None
                         if USE_RSI_FILTER:
                             rsi = compute_rsi(market.ticker)
                             if rsi is None:
@@ -982,7 +993,7 @@ if __name__ == "__main__":
                                 state["current_trade"] = {"ticker": market.ticker, "side": side,
                                     "count": res["filled"], "entry_price_cents": entry_p,
                                     "status": "filled", "entry_fees_cents": res["fees_cents"],
-                                    "stop_armed": False}
+                                    "stop_armed": False, "rsi_at_entry": rsi}
                                 mark_ticker_entered(state, market.ticker)
                                 save_state(state); play_sound("buy")
                                 log(f"✅ Filled {res['filled']}/{qty} @ {entry_p}c (fees {res['fees_cents']}c)")
