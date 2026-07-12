@@ -4,7 +4,7 @@ import json
 import time
 import math
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 from kalshi_python_sync import Configuration, KalshiClient
 
@@ -63,7 +63,7 @@ STATE_FILE = os.path.join(BASE_DIR, "state.json")
 TRADES_FILE = os.path.join(BASE_DIR, "trades.json")
 
 # --- Trading mode ---
-PAPER_MODE = False              # Shadow/paper trading. No real orders are placed.
+PAPER_MODE = True              # Shadow/paper trading. No real orders are placed.
 PAPER_START_BALANCE = 500.0   # Simulated starting cash; moves with realized PnL.
 PAPER_SAFETY_FLOOR = 0.0       # Paper floor (live SAFETY_FLOOR would block trading from $1000).
 
@@ -77,7 +77,7 @@ MAX_POSITION_DOLLARS = 500.0   # Dollar ceiling per entry.
 # contracts in seconds. Enforcement is fail-safe: if the current position can't be
 # read, the bot SKIPS the entry rather than assuming flat. Set to a size you're
 # comfortable holding to settlement on one 15-min contract. 0 disables the cap.
-MAX_CONTRACTS_PER_MARKET = 10
+MAX_CONTRACTS_PER_MARKET = 150
 FEE_RATE = 0.07                # Kalshi trading-fee rate for paper/sim PnL. VERIFY against the
                                # current KXBTC15M schedule (get_series_fee_changes); fees change.
 
@@ -96,7 +96,7 @@ ENTRY_TIME_MAX = 10.0          # Minutes-before-close window end.
 # open market plus recently-settled ones — same series the bot already reads, no
 # external data source needed. See compute_rsi() for the multi-market merge.
 USE_RSI_FILTER = True          # Set False to disable and trade all 96c prints.
-RSI_MIN = 60                   # Skip entries where RSI-14 is below this threshold.
+RSI_MIN = 55                   # Skip entries where RSI-14 is below this threshold.
 RSI_LOOKBACK_MIN = 60          # Minutes of candle history to fetch (need >= 15 valid closes).
 
 # --- FOMC skip ---
@@ -208,6 +208,61 @@ def is_fomc_day(now=None):
         return False
     now = now or datetime.now(pytz.timezone("US/Eastern"))
     return now.strftime("%Y-%m-%d") in FOMC_DECISION_DATES
+
+def next_window_open(now=None):
+    """Return the next datetime at which in_trading_window() becomes True.
+
+    Steps forward one minute at a time so the reported time lands exactly on the
+    schedule boundary (a coarser step overshoots — e.g. probing from 21:59 in
+    15-min hops reports 22:14 when the window really opens at 22:00). Capped at
+    8 days of lookahead; returns None if nothing opens in that span.
+
+    Only ever called on the IDLE path, and the idle loop sleeps 10s between
+    ticks, so the worst-case ~11.5k cheap arithmetic checks are negligible.
+    """
+    now = now or datetime.now(pytz.timezone("US/Eastern"))
+    probe = now.replace(second=0, microsecond=0)
+    for _ in range(8 * 24 * 60):         # 8 days of 1-min steps
+        probe += timedelta(minutes=1)
+        if in_trading_window(probe) and not is_fomc_day(probe):
+            return probe
+    return None
+
+def bot_status(now=None, has_position=False):
+    """Describe whether the bot can currently OPEN new trades, and if not, why.
+
+    Returns (label, detail) where label is one of:
+        "LIVE"    - inside the schedule, free to open new entries
+        "IDLE"    - cannot open new entries right now (detail says why)
+
+    Note this describes *entry eligibility*, not whether the process is running.
+    An open position is still monitored (and can still stop out) while IDLE —
+    the schedule gates new entries only, so that's called out explicitly.
+    """
+    now = now or datetime.now(pytz.timezone("US/Eastern"))
+
+    if is_fomc_day(now):
+        reason = "FOMC day"
+    elif not in_trading_window(now):
+        reason = "outside schedule"
+    else:
+        return ("LIVE", "in trading window")
+
+    # Idle — say when we next wake up, so a glance at the heartbeat answers
+    # "is it broken or just waiting?"
+    nxt = next_window_open(now)
+    if nxt is None:
+        detail = reason
+    else:
+        delta = nxt - now
+        hrs, rem = divmod(int(delta.total_seconds()), 3600)
+        mins = rem // 60
+        eta = f"{hrs}h{mins:02d}m" if hrs else f"{mins}m"
+        detail = f"{reason}, opens {nxt.strftime('%a %H:%M')} ({eta})"
+
+    if has_position:
+        detail += " — holding, stop still active"
+    return ("IDLE", detail)
 
 # ====================== HELPERS ======================
 def log(msg: str):
@@ -856,8 +911,17 @@ if __name__ == "__main__":
                         save_state(state); play_sound("stop"); continue
 
             # --- HEARTBEAT ---
+            # Show entry eligibility (LIVE vs IDLE) so a glance at the terminal
+            # answers "is it trading, waiting, or stuck?" — IDLE also reports why
+            # and when it next opens. Note a held position is still monitored while
+            # IDLE (the schedule gates new ENTRIES only), which bot_status() says.
+            hb_label, hb_detail = bot_status(now_et, has_position=bool(curr))
             status_text = f" [IN: {curr['side'].upper()} @ {curr['entry_price_cents']}c{' ARMED' if curr.get('stop_armed') else ''}]" if curr else ""
-            print(f"\r[{now_et.strftime('%H:%M:%S')}] {mode} | Cash: ${cash:.2f} | Session: ${SESSION_PNL:+.2f}{status_text}", end="")
+            hb_line = (f"[{now_et.strftime('%H:%M:%S')}] {mode} | {hb_label}: {hb_detail} | "
+                       f"Cash: ${cash:.2f} | Session: ${SESSION_PNL:+.2f}{status_text}")
+            # ljust pads shorter lines so a \r redraw fully erases a longer previous
+            # line (status text length varies a lot between LIVE and IDLE states).
+            print(f"\r{hb_line.ljust(140)}", end="")
 
             if not markets:
                 time.sleep(5); continue
