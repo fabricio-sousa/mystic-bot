@@ -68,6 +68,10 @@ PAPER_START_BALANCE = 500.0   # Simulated starting cash; moves with realized PnL
 PAPER_SAFETY_FLOOR = 0.0       # Paper floor (live SAFETY_FLOOR would block trading from $1000).
 
 FLAT_RISK = 0.05               # Fraction of cash staked per entry (before caps below).
+                               # v6.1.0: 5% confirmed by MC (20k sims, loss rates up to
+                               # the 0.7% 95% UB): P(10%-halt) ~4% @ 5% risk vs 40-59%
+                               # @ 10% risk — one full 96c loss at 10% is ~-9.6%, an
+                               # effectively guaranteed sticky halt.
 MAX_POSITION_DOLLARS = 500.0   # Dollar ceiling per entry.
 
 # Hard per-market contract cap — an INDEPENDENT safety layer on top of dollar/risk
@@ -95,6 +99,12 @@ ENTRY_TIME_MAX = 10.0          # Minutes-before-close window end.
 # RSI is computed from 1-min KXBTC15M candles (BTC-implied price) spanning the current
 # open market plus recently-settled ones — same series the bot already reads, no
 # external data source needed. See compute_rsi() for the multi-market merge.
+# v6.1.0 finding (May-Jul re-test): because RSI runs on the YES price series,
+# RSI>=55 structurally suppresses NO-side entries (a 4c yes print = falling
+# series = low RSI). Unfiltered NO entries won only ~57% in-sample and cratered
+# the account — this filter is doing double duty as the side selector, and its
+# value is regime-dependent (BTC uptrend). Do NOT disable without re-running
+# backtest.py.
 USE_RSI_FILTER = True          # Set False to disable and trade all 96c prints.
 RSI_MIN = 55                   # Skip entries where RSI-14 is below this threshold.
 RSI_LOOKBACK_MIN = 60          # Minutes of candle history to fetch (need >= 15 valid closes).
@@ -120,15 +130,18 @@ FOMC_DECISION_DATES = {
 }
 
 # --- Two-stage stop ---
-# ENABLED with a 45%-down threshold (arm 70c, trigger 53c from a 96c entry).
-# Backtesting on real Kalshi data showed this converts full -96c losses into
-# ~-40c stop-outs and beat no-stop at every slippage level tested (+84.2% ROI /
-# $573 max DD vs +71.7% / $900 without). Unlike the old 80/75c thresholds — which
-# fired instantly because a 96c favorite's bid sits far above 75c — the 53c trigger
-# only fires on a genuine ~45% reversal, so normal intraday ticks don't trip it.
-# The stop arms when the held-side bid falls to STOP_ARM_PRICE and exits when it
-# falls further to STOP_TRIGGER_PRICE. Set USE_STOP=False to hold to settlement.
-USE_STOP = True
+# v6.1.0: OFF (hold-to-settle). The earlier Apr-Jun backtest favored a stop, but
+# the May 17-Jul 21 2026 re-test on real 1-min candles (6,307 markets, 434
+# entries under the live filter set) reversed that: ALL 35 stop-outs were
+# whipsaws — every stopped market settled as a WINNER, including 31 that dipped
+# <=40c inside the final 2 minutes. Dip depth carried zero information about
+# settlement; the 75->60 stop cost -$773 vs holding, and every arm/trigger and
+# time-conditional variant tested also lost money while still tripping the 10%
+# drawdown halt within the first week. Tail risk is now handled by
+# FLAT_RISK=0.05 + the drawdown halt instead of a price stop.
+# Params left in place for re-enable if the regime turns (watch the monthly
+# backtest.py re-run: if dip-recovery rates degrade, revisit).
+USE_STOP = False
 STOP_ARM_PRICE = 75            # Only used if USE_STOP=True. Begin monitoring once bid <= this.
 STOP_TRIGGER_PRICE = 60        # Only used if USE_STOP=True. Exit once armed & bid <= this.
 
@@ -787,7 +800,7 @@ if __name__ == "__main__":
     rsi_txt  = f"RSI≥{RSI_MIN}" if USE_RSI_FILTER else "RSI filter OFF"
     fomc_txt = "skip FOMC days" if SKIP_FOMC_DAYS else "FOMC skip OFF"
     dd_txt   = f"drawdown halt {int(MAX_DRAWDOWN_PCT*100)}%" if (USE_DRAWDOWN_LIMIT and not PAPER_MODE) else "drawdown OFF"
-    log(f"🪄 Magick Bot v6.0.0 Active [{mode}] | {stop_txt} | schedule A (drop 17-22 ET) | {rsi_txt} | {fomc_txt} | {dd_txt}")
+    log(f"🪄 Magick Bot v6.1.0 Active [{mode}] | {stop_txt} | schedule A (drop 17-22 ET) | {rsi_txt} | {fomc_txt} | {dd_txt}")
 
     while True:
         try:
