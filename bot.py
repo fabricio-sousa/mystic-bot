@@ -337,8 +337,14 @@ def compute_rsi(current_ticker):
             for m in getattr(resp_s, "markets", []) or []:
                 if m.ticker != current_ticker:
                     tickers.append(m.ticker)
-        except Exception:
-            pass   # settled lookup is a best-effort enhancement
+        except Exception as e:
+            # 2026-07-23: this was a silent `pass`, which is why the two "1/1
+            # markets" RSI stalls in the paper log had no diagnosable cause.
+            # RSI_LOOKBACK_MIN=60 should reliably catch 2+ settled markets
+            # (one settles every ~15min), so a fallback to just current_ticker
+            # means this call itself is failing — now visible instead of silent.
+            log(f"⚠️ RSI: settled-market lookup failed ({e}) — "
+                f"falling back to current market only")
 
         # 2. Batch fetch 1-min candles across all collected tickers
         batch = client.batch_get_market_candlesticks(
