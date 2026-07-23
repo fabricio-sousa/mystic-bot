@@ -49,7 +49,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # real capital. Requires a SEPARATE demo account + demo API keys from demo.kalshi.co.
 # When True, PAPER_MODE must be False (you want real order calls, just on the sandbox).
 # NOTE: defined here (before the key-file paths) because those paths depend on it.
-DEMO_MODE = False              # True = place real orders against the demo sandbox host.
+DEMO_MODE = True              # True = place real orders against the demo sandbox host.
 PROD_HOST = "https://api.elections.kalshi.com/trade-api/v2"
 DEMO_HOST = "https://demo-api.kalshi.co/trade-api/v2"
 
@@ -64,7 +64,7 @@ TRADES_FILE = os.path.join(BASE_DIR, "trades.json")
 
 # --- Trading mode ---
 PAPER_MODE = True              # Shadow/paper trading. No real orders are placed.
-PAPER_START_BALANCE = 600.0   # Simulated starting cash; moves with realized PnL.
+PAPER_START_BALANCE = 500.0   # Simulated starting cash; moves with realized PnL.
 PAPER_SAFETY_FLOOR = 0.0       # Paper floor (live SAFETY_FLOOR would block trading from $1000).
 
 FLAT_RISK = 0.05               # Fraction of cash staked per entry (before caps below).
@@ -191,26 +191,14 @@ SESSION_PNL = 0.00
 
 # ====================== TRADING SCHEDULE ======================
 def in_trading_window(now=None):
-    """v6.1.0->24/7: no schedule restriction. The Apr-Jun backtest cited below
-    justified dropping 17:00-22:00 ET; a later re-test on real candles
-    (2026-05-17 to 07-21, 805 entries under the live filter set) did not
-    reproduce that effect — win rate was flat 97-100% across every hour and
-    every day of week, including that same weekday window and Saturdays
-    (excluded set alone: 370/371 = 99.73%, +$779 left on the table). RSI +
-    FOMC skip are doing the real filtering; kept as a function (not inlined)
-    so a future regime check can restore a restriction without touching call
-    sites.
+    """v6.2.0->v6.3.0: Schedule A reinstated. Trade all hours EXCEPT
+    17:00-21:59 ET on weekdays, plus the Sunday afternoon window; Saturday
+    closed. Briefly replaced with 24/7 after a May-Jul re-test showed flat
+    win rates across every hour/day in that sample — reverted back to
+    Schedule A. See _in_trading_window_247() to switch back if a future
+    backtest.py re-run supports it again.
 
     Returns True if the bot is allowed to open new trades right now."""
-    return True
-
-def _in_trading_window_schedule_a(now=None):
-    """Retired 2026-07-22 (v6.2.0). Original rationale: backtesting on real
-    Kalshi data (Apr-Jun 2026) showed 17:00-22:00 ET lost -$9/trade on
-    average vs +$3-6/trade elsewhere, driven by erratic post-market crypto
-    vol. Not reproduced in the May-Jul re-test (see in_trading_window()
-    docstring) — kept for reference / quick revert if a monthly backtest.py
-    re-run shows a toxic hour or day re-emerging."""
     now = now or datetime.now(pytz.timezone("US/Eastern"))
     day = now.weekday()   # 0=Mon ... 5=Sat, 6=Sun
     t = now.hour + now.minute / 60.0
@@ -225,6 +213,16 @@ def _in_trading_window_schedule_a(now=None):
 
     # Saturday: closed
     return False
+
+def _in_trading_window_247(now=None):
+    """v6.2.0's 24/7 variant. Backtest 2026-05-17 to 07-21 (805 entries under
+    the live filter set) showed win rate flat across every hour and day,
+    including the weekday 17:00-22:00 window and Saturdays that Schedule A
+    excludes (excluded set alone: 370/371 = 99.73%, +$779). Not reproduced
+    from the earlier Apr-Jun sample that originally justified Schedule A —
+    two windows disagreed, so Schedule A was reinstated as the conservative
+    default. Revisit with a fresh backtest.py run before re-enabling."""
+    return True
 
 def is_fomc_day(now=None):
     """Return True if today is a configured FOMC decision date and SKIP_FOMC_DAYS
@@ -814,7 +812,7 @@ if __name__ == "__main__":
     rsi_txt  = f"RSI≥{RSI_MIN}" if USE_RSI_FILTER else "RSI filter OFF"
     fomc_txt = "skip FOMC days" if SKIP_FOMC_DAYS else "FOMC skip OFF"
     dd_txt   = f"drawdown halt {int(MAX_DRAWDOWN_PCT*100)}%" if (USE_DRAWDOWN_LIMIT and not PAPER_MODE) else "drawdown OFF"
-    log(f"🪄 Magick Bot v6.2.0 Active [{mode}] | {stop_txt} | 24/7 (no schedule restriction) | {rsi_txt} | {fomc_txt} | {dd_txt}")
+    log(f"🪄 Magick Bot v6.3.0 Active [{mode}] | {stop_txt} | schedule A (drop 17-22 ET) | {rsi_txt} | {fomc_txt} | {dd_txt}")
 
     while True:
         try:
