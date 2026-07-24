@@ -61,6 +61,7 @@ PRIVATE_FILE = os.path.join(BASE_DIR, "private_demo.txt" if DEMO_MODE else "priv
 LOG_FILE = os.path.join(BASE_DIR, "log.txt")
 STATE_FILE = os.path.join(BASE_DIR, "state.json")
 TRADES_FILE = os.path.join(BASE_DIR, "trades.json")
+UNFILLED_ATTEMPTS_FILE = os.path.join(BASE_DIR, "unfilled_attempts.json")
 
 # --- Trading mode ---
 PAPER_MODE = True              # Shadow/paper trading. No real orders are placed.
@@ -86,7 +87,13 @@ FEE_RATE = 0.07                # Kalshi trading-fee rate for paper/sim PnL. VERI
                                # current KXBTC15M schedule (get_series_fee_changes); fees change.
 
 # --- Entry ---
-MAX_SLIPPAGE = 0               # Pay up to ask + 0c (fills at the ask, no slippage).
+MAX_SLIPPAGE = 1               # v6.4.0: was 0. With 0, the IOC order was only
+                               # marketable if the ask hadn't moved at ALL since
+                               # the price used to build it was read — no cushion
+                               # for the real network latency of the RSI check in
+                               # between (see the fresh re-check added below,
+                               # which is the primary fix; this is the backstop
+                               # for whatever latency remains after that).
 ENTRY_TIME_MIN = 1.0           # Minutes-before-close window start.
 ENTRY_TIME_MAX = 10.0          # Minutes-before-close window end.
 
@@ -466,6 +473,27 @@ def update_trades_json(trade_entry):
     trades.append(trade_entry)
     with open(TRADES_FILE, "w", encoding="utf-8") as f: json.dump(trades, f, indent=2)
 
+def log_unfilled_attempt(entry):
+    """v6.4.0: real telemetry for missed entries, replacing the bare console
+    log. Two distinct causes get recorded so they can be told apart:
+      'price_moved_before_submit' — the fresh re-check (added in v6.4.0) saw
+          the ask had already moved past our slippage tolerance, so we never
+          sent an order at all (no wasted IOC attempt).
+      'ioc_unfilled'              — an order WAS submitted and the exchange
+          couldn't fill it (or only partially) before the IOC auto-cancel.
+    Fields: reason, ticker, side, stale_price_cents (price read at the top of
+    the loop, before RSI), fresh_price_cents (price re-checked right before
+    submit, None if reason=ioc_unfilled since that path skips the extra call),
+    qty_attempted, rsi_at_entry, time_left_min, timestamp."""
+    attempts = []
+    if os.path.exists(UNFILLED_ATTEMPTS_FILE):
+        with open(UNFILLED_ATTEMPTS_FILE, "r", encoding="utf-8") as f:
+            try: attempts = json.load(f)
+            except: attempts = []
+    attempts.append(entry)
+    with open(UNFILLED_ATTEMPTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(attempts, f, indent=2)
+
 def safe_price_cents(value) -> int:
     try: return int(round(float(value or 0) * 100))
     except: return 0
@@ -818,7 +846,7 @@ if __name__ == "__main__":
     rsi_txt  = f"RSI≥{RSI_MIN}" if USE_RSI_FILTER else "RSI filter OFF"
     fomc_txt = "skip FOMC days" if SKIP_FOMC_DAYS else "FOMC skip OFF"
     dd_txt   = f"drawdown halt {int(MAX_DRAWDOWN_PCT*100)}%" if (USE_DRAWDOWN_LIMIT and not PAPER_MODE) else "drawdown OFF"
-    log(f"🪄 Magick Bot v6.3.0 Active [{mode}] | {stop_txt} | schedule A (drop 17-22 ET) | {rsi_txt} | {fomc_txt} | {dd_txt}")
+    log(f"🪄 Magick Bot v6.4.0 Active [{mode}] | {stop_txt} | schedule A (drop 17-22 ET) | {rsi_txt} | {fomc_txt} | {dd_txt}")
 
     while True:
         try:
@@ -1055,6 +1083,42 @@ if __name__ == "__main__":
                                 time.sleep(3); continue
                             log(f"✅ RSI filter passed: RSI={rsi} >= {RSI_MIN}")
 
+                        # --- v6.4.0: fresh price re-check right before submit ---
+                        # ask_price was read at the TOP of this loop iteration, before
+                        # compute_rsi()'s network calls (settled-market lookup +
+                        # candlestick batch fetch). That's real latency — often several
+                        # hundred ms, sometimes more — during which the live ask can
+                        # move off 96c, especially this deep into the pre-close window
+                        # where price is actively converging. Submitting a stale price
+                        # with MAX_SLIPPAGE=0 (the old default) meant the IOC order was
+                        # only ever marketable if the market had NOT moved at all in
+                        # that gap. Re-checking here closes that gap directly; the
+                        # MAX_SLIPPAGE bump above is just the backstop for whatever
+                        # latency remains between this check and the order landing.
+                        stale_price = ask_price
+                        if not PAPER_MODE:
+                            try:
+                                fresh_market = client.get_market(market.ticker).market
+                                fresh_field = "yes_ask_dollars" if side == "yes" else "no_ask_dollars"
+                                fresh_ask = safe_price_cents(getattr(fresh_market, fresh_field, None))
+                            except Exception as e:
+                                log(f"⚠️ Fresh price re-check failed ({e}) — using last-known {stale_price}c")
+                                fresh_ask = None
+                            if fresh_ask and fresh_ask > stale_price + MAX_SLIPPAGE:
+                                log(f"⏭️ Price moved {stale_price}c -> {fresh_ask}c before submit "
+                                    f"(> {MAX_SLIPPAGE}c tolerance) — skipping, not submitting a doomed order")
+                                log_unfilled_attempt({
+                                    "timestamp": now_et.strftime("%Y-%m-%d %H:%M:%S"),
+                                    "reason": "price_moved_before_submit",
+                                    "ticker": market.ticker, "side": side,
+                                    "stale_price_cents": stale_price, "fresh_price_cents": fresh_ask,
+                                    "qty_attempted": None, "rsi_at_entry": rsi,
+                                    "time_left_min": round(time_left, 1),
+                                })
+                                time.sleep(2); continue
+                            if fresh_ask:
+                                ask_price = fresh_ask   # use the freshest read (may even be better than stale)
+
                         buy_price = min(99, ask_price + MAX_SLIPPAGE)
                         qty = int(min(MAX_POSITION_DOLLARS, (cash * FLAT_RISK)) * 100 // buy_price)
 
@@ -1094,8 +1158,17 @@ if __name__ == "__main__":
                                 log(f"✅ Filled {res['filled']}/{qty} @ {entry_p}c (fees {res['fees_cents']}c)")
                                 time.sleep(5)
                             else:
-                                log("⚠️ Entry unfilled & remainder canceled. 15s Cooldown...")
-                                time.sleep(15)
+                                log("⚠️ Entry unfilled & remainder canceled. 5s Cooldown...")
+                                log_unfilled_attempt({
+                                    "timestamp": now_et.strftime("%Y-%m-%d %H:%M:%S"),
+                                    "reason": "ioc_unfilled",
+                                    "ticker": market.ticker, "side": side,
+                                    "stale_price_cents": stale_price, "fresh_price_cents": ask_price,
+                                    "qty_attempted": qty, "rsi_at_entry": rsi,
+                                    "time_left_min": round(time_left, 1),
+                                })
+                                time.sleep(5)
+
 
             time.sleep(1)
         except Exception as e:
