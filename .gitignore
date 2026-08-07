@@ -4,3 +4,7 @@ private.txt
 status.json
 state.json
 log.txt
+shadow_heartbeat.txt
+shadow_log.txt
+shadow_state.json
+shadow_status.json
