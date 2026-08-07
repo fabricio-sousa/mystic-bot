@@ -51,6 +51,14 @@ python dashboard.py
 
 Then open `http://localhost:5000`. Polls every 3 seconds. Read-only — never touches the Kalshi API or your credentials, only the files `bot.py` already writes. Safe to run alongside the bot at all times, including from a different machine pointed at a shared folder.
 
+For a shadow session, use `shadowdashboard.py` instead — same tool, pointed at the `shadow_*` files, running on port 5001 so it can sit alongside the real dashboard without conflict:
+
+```
+python shadowdashboard.py
+```
+
+Then open `http://localhost:5001`. Visually distinct on purpose (violet accent, a persistent "SHADOW MODE — SIMULATED, NO REAL MONEY" badge in the header) so the two are never confusable at a glance.
+
 ## Configuration
 
 All in the `CONFIG` section at the top of `bot.py`:
