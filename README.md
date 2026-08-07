@@ -35,6 +35,16 @@ python bot.py
 
 Runs until stopped (Esc) or until a shutdown condition fires. Press `c` at any time to clear the current tracked position from `state.json` (manual override — use if you've closed a position by hand on Kalshi and the bot's state has drifted from reality).
 
+### Shadow mode
+
+```
+python bot.py --shadow --shadow-cash 5000
+```
+
+Runs the exact same live market data, filters, and decision logic as real trading, but never places a real order — fills are simulated at the observed live price with Kalshi's real published taker fee applied, tracked in its own ledger (`shadow_cash`, inside `shadow_state.json`). Safe to run **at the same time**, in the same folder, as a real instance — it reads/writes an entirely separate set of files (`shadow_state.json`, `shadow_trades.json`, `shadow_log.txt`, `shadow_status.json`, `shadow_heartbeat.txt`), so the two never collide. `--shadow-cash` sets the starting simulated balance (default 5000) and only matters for shadow mode.
+
+What this does and doesn't tell you: shadow mode trades against *today's* live market rather than a frozen historical backtest window, so it's the only way to check whether an edge found in past data still exists right now. It does **not** simulate real order-book depth, slippage, or how other participants might react to a real order — a simulated fill at the observed price is still an optimistic assumption, just a live one instead of a historical one. Treat divergence between shadow and real-money results (once the real bot has enough size to compare meaningfully) as a direct, measurable read on how much that gap actually costs.
+
 ```
 python dashboard.py
 ```
