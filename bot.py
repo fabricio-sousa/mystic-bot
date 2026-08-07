@@ -2,6 +2,7 @@ import os
 import json
 import time
 import uuid
+import argparse
 from datetime import datetime
 import pytz
 import requests
@@ -15,21 +16,42 @@ try:
 except ImportError:
     HAS_WINDOWS = False
 
+# ====================== SHADOW MODE ======================
+# Shadow mode runs the exact same live market data, filters, and decision
+# logic as real trading, but never calls Kalshi's order-placement API --
+# fills are simulated at the observed live price (the same optimistic-fill
+# assumption the backtest uses, now against live prices instead of
+# historical bars) with the real published taker fee applied. Tracks its
+# own cash ledger (shadow_state.json etc.) so it can run in parallel with
+# a real instance, pointed at the same folder, without ever colliding.
+# Does NOT solve for real slippage/fill quality -- see README.md.
+_argp = argparse.ArgumentParser()
+_argp.add_argument("--shadow", action="store_true", help="Run in shadow mode: simulated fills, no real orders placed")
+_argp.add_argument("--shadow-cash", type=float, default=5000.0, help="Starting simulated cash for shadow mode (default: 5000)")
+_args = _argp.parse_args()
+SHADOW_MODE = _args.shadow
+SHADOW_TAKER_FEE_MULTIPLIER = 0.07  # Kalshi's real published taker formula, verified against their fee schedule
+
+def shadow_taker_fee_dollars(price_cents, count):
+    p = price_cents / 100.0
+    return count * SHADOW_TAKER_FEE_MULTIPLIER * p * (1 - p)
+
 # ====================== CONFIG ======================
-BOT_NAME = "Mystic-Bot 1.0"
+BOT_NAME = "Mystic-Bot 1.0" + (" [SHADOW]" if SHADOW_MODE else "")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-APIKEY_FILE = os.path.join(BASE_DIR, "apikey.txt")
-PRIVATE_FILE = os.path.join(BASE_DIR, "private.txt")
-LOG_FILE = os.path.join(BASE_DIR, "log.txt")
-STATE_FILE = os.path.join(BASE_DIR, "state.json")
-TRADES_FILE = os.path.join(BASE_DIR, "trades.json")
-HEARTBEAT_FILE = os.path.join(BASE_DIR, "heartbeat.txt")
-STATUS_FILE = os.path.join(BASE_DIR, "status.json")
+_prefix = "shadow_" if SHADOW_MODE else ""
+APIKEY_FILE = os.path.join(BASE_DIR, "apikey.txt")     # never shadow-prefixed -- real credentials, read-only, needed in both modes for market data
+PRIVATE_FILE = os.path.join(BASE_DIR, "private.txt")   # same
+LOG_FILE = os.path.join(BASE_DIR, f"{_prefix}log.txt")
+STATE_FILE = os.path.join(BASE_DIR, f"{_prefix}state.json")
+TRADES_FILE = os.path.join(BASE_DIR, f"{_prefix}trades.json")
+HEARTBEAT_FILE = os.path.join(BASE_DIR, f"{_prefix}heartbeat.txt")
+STATUS_FILE = os.path.join(BASE_DIR, f"{_prefix}status.json")
 
 MAX_SLIPPAGE = 1
 MAX_POSITION_DOLLARS = 500.0
-SAFETY_FLOOR = 78
+SAFETY_FLOOR_PCT = 0.75       # bot halts if cash drops to this fraction of the highest balance ever reached (trailing, not a fixed dollar amount)
 STRIKE_LIMIT = 3
 STOP_LOSS_THRESHOLD = 0.20
 ENTRY_THRESHOLD = 93          # yes_bid/no_bid cents level that triggers entry (was 97)
@@ -286,7 +308,24 @@ def place_order(ticker, side, count, action, price_cents=None):
 
     Returns the number of contracts actually filled (0 if none). Callers
     should treat this as a partial-fill-aware count, not a boolean.
+
+    In SHADOW_MODE, never calls the real Kalshi order API -- simulates a
+    full fill at the requested price_cents (the same optimistic-fill
+    assumption used throughout this project's backtesting) and deducts
+    the real published taker fee from the shadow cash ledger. Position
+    PnL itself (the price-difference component) is applied by the caller
+    at settlement/stop-loss time, same as in real mode -- this function
+    only ever handles the fee, so its contract (return a fill count) stays
+    identical in both modes and no caller needs to know which mode is active.
     """
+    if SHADOW_MODE:
+        fee = shadow_taker_fee_dollars(price_cents, count)
+        state = load_state()
+        state["shadow_cash"] = state.get("shadow_cash", _args.shadow_cash) - fee
+        save_state(state)
+        log(f"🌗 SHADOW {action.upper()} {count}x {ticker} @ {price_cents}c (fee ${fee:.4f}, simulated fill)")
+        return count
+
     try:
         client_order_id = str(uuid.uuid4())
         actual_price_cents = min(99, price_cents + MAX_SLIPPAGE) if action == "buy" else max(1, price_cents - MAX_SLIPPAGE)
@@ -421,9 +460,14 @@ def reconcile_state_with_positions(state):
 # ====================== MAIN LOOP ======================
 if __name__ == "__main__":
     log(f"🪄 {BOT_NAME} Active ({ENTRY_THRESHOLD}c Done-Deal Filters + New Schedule)")
+    if SHADOW_MODE:
+        log(f"🌗 SHADOW MODE: simulated fills only, no real orders. Starting cash: ${_args.shadow_cash:.2f}. "
+            f"Writing to {os.path.basename(STATE_FILE)} / {os.path.basename(LOG_FILE)} / "
+            f"{os.path.basename(TRADES_FILE)} (separate from a real instance's files).")
 
     state = load_state()
-    state = reconcile_state_with_positions(state)
+    if not SHADOW_MODE:
+        state = reconcile_state_with_positions(state)  # meaningless in shadow mode -- no real positions exist to reconcile against
 
     while True:
         try:
@@ -436,16 +480,29 @@ if __name__ == "__main__":
 
             now_et = datetime.now(pytz.timezone("US/Eastern"))
             state = load_state()
-            cash = client.get_balance().balance / 100.0
+            cash = state.get("shadow_cash", _args.shadow_cash) if SHADOW_MODE else client.get_balance().balance / 100.0
+            if SHADOW_MODE and "shadow_cash" not in state:
+                state["shadow_cash"] = cash
+                save_state(state)
             curr = state.get("current_trade")
             is_trading_window = in_trading_window()
+
+            # Trailing safety floor: never allow more than a (1 - SAFETY_FLOOR_PCT)
+            # drawdown from the highest balance ever observed -- persisted in
+            # state.json so it survives restarts, and ratchets up with every
+            # new high instead of becoming irrelevant after a good run.
+            peak_cash = max(state.get("peak_cash") or cash, cash)
+            if peak_cash != state.get("peak_cash"):
+                state["peak_cash"] = peak_cash
+                save_state(state)
+            safety_floor = peak_cash * SAFETY_FLOOR_PCT
 
             if OVERRIDE_TRIGGERED:
                 log("🛠️ Manual Override: Clearing State"); state["current_trade"] = None
                 save_state(state); OVERRIDE_TRIGGERED = False
 
-            if cash <= SAFETY_FLOOR or state.get("strikes", 0) >= STRIKE_LIMIT:
-                log(f"🚨 Shutdown: Cash ${cash:.2f} | Strikes {state.get('strikes')}"); break
+            if cash <= safety_floor or state.get("strikes", 0) >= STRIKE_LIMIT:
+                log(f"🚨 Shutdown: Cash ${cash:.2f} | Floor ${safety_floor:.2f} (75% of peak ${peak_cash:.2f}) | Strikes {state.get('strikes')}"); break
 
             # --- TICKER FETCH ---
             resp = client.get_markets(series_ticker="KXBTC15M", limit=5, status="open")
@@ -474,6 +531,8 @@ if __name__ == "__main__":
                         pnl = (live_bid - entry_p) * filled / 100.0
                         update_trades_json({"timestamp": now_et.strftime("%Y-%m-%d %H:%M:%S"), "ticker": curr['ticker'], "side": curr['side'], "pnl": round(pnl, 2), "type": "STOP_LOSS", "count": filled})
                         SESSION_PNL += pnl
+                        if SHADOW_MODE:
+                            state["shadow_cash"] = state.get("shadow_cash", _args.shadow_cash) + pnl
                         if filled >= curr['count']:
                             state["current_trade"] = None
                         else:
@@ -494,6 +553,8 @@ if __name__ == "__main__":
                 "cash": round(cash, 2),
                 "session_pnl": round(SESSION_PNL, 2),
                 "strikes": state.get("strikes", 0),
+                "peak_cash": round(peak_cash, 2),
+                "safety_floor": round(safety_floor, 2),
                 "risk_pct": round(RISK_PCT * 100, 1),
                 "entry_threshold": ENTRY_THRESHOLD,
                 "is_trading_window": is_trading_window,
@@ -523,6 +584,8 @@ if __name__ == "__main__":
                     pnl = (100 - curr['entry_price_cents']) * curr['count'] / 100.0 if won else -(curr['entry_price_cents'] * curr['count'] / 100.0)
                     update_trades_json({"timestamp": now_et.strftime("%Y-%m-%d %H:%M:%S"), "ticker": curr['ticker'], "side": curr['side'], "pnl": round(pnl, 2), "type": "SETTLEMENT"})
                     SESSION_PNL += pnl
+                    if SHADOW_MODE:
+                        state["shadow_cash"] = state.get("shadow_cash", _args.shadow_cash) + pnl
                     log(f"🏁 RESULT: {res.upper()} | {'WIN' if won else 'LOSS'} | PnL: ${pnl:+.2f}")
                     state["strikes"] = 0 if won else state.get("strikes", 0) + 1
                     state["current_trade"] = None; save_state(state)
