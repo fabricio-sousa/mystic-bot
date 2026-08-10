@@ -508,7 +508,7 @@ if __name__ == "__main__":
                 save_state(state); OVERRIDE_TRIGGERED = False
 
             if cash <= safety_floor or state.get("strikes", 0) >= STRIKE_LIMIT:
-                log(f"🚨 Shutdown: Cash ${cash:.2f} | Floor ${safety_floor:.2f} (75% of peak ${peak_cash:.2f}) | Strikes {state.get('strikes')}"); break
+                log(f"🚨 Shutdown: Cash ${cash:.2f} | Floor ${safety_floor:.2f} ({int(SAFETY_FLOOR_PCT*100)}% of peak ${peak_cash:.2f}) | Strikes {state.get('strikes')}"); break
 
             # --- TICKER FETCH ---
             resp = client.get_markets(series_ticker="KXBTC15M", limit=5, status="open")
@@ -665,9 +665,13 @@ if __name__ == "__main__":
                             LAST_FILTER_CHECK["filters_ok"] = False
                             LAST_FILTER_CHECK["reason"] = skip_reason
                     else:
-                        # Optional: uncomment to see why entries are skipped
-                        # log(f"⏭ Skip {ENTRY_THRESHOLD}c {side}: {reason}")
-                        pass
+                        # Every touch that gets this far is a real, rare event (this
+                        # is the rarest signal in the whole strategy) -- log it
+                        # permanently rather than only in status.json's
+                        # last_filter_check, which gets overwritten every loop and
+                        # can't answer "how many touches happened and why were they
+                        # all rejected" after the fact.
+                        log(f"⏭ Skip {ENTRY_THRESHOLD}c {side.upper()}: {reason}")
 
             time.sleep(1)
         except Exception as e:
