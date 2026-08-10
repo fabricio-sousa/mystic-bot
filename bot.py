@@ -37,7 +37,7 @@ def shadow_taker_fee_dollars(price_cents, count):
     return count * SHADOW_TAKER_FEE_MULTIPLIER * p * (1 - p)
 
 # ====================== CONFIG ======================
-BOT_NAME = "Mystic-Bot 1.0" + (" [SHADOW]" if SHADOW_MODE else "")
+BOT_NAME = "Mystic-Bot 1.0 24/7" + (" [SHADOW]" if SHADOW_MODE else "")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _prefix = "shadow_" if SHADOW_MODE else ""
@@ -54,60 +54,36 @@ MAX_POSITION_DOLLARS = 500.0
 SAFETY_FLOOR_PCT = 0.75       # bot halts if cash drops to this fraction of the highest balance ever reached (trailing, not a fixed dollar amount)
 STRIKE_LIMIT = 3
 STOP_LOSS_THRESHOLD = 0.20
-ENTRY_THRESHOLD = 93          # yes_bid/no_bid cents level that triggers entry (was 97)
-RISK_PCT = 0.01               # flat risk per trade; was per-window via get_dynamic_risk, now constant everywhere
-ORDER_POLL_SECONDS = 3       # how many 1s polls to wait for a fill before canceling the rest
-WICK_MIN_PCT = 0.00015       # min rejection-wick size as a % of BTC price (~$15 at $100k BTC); scales with price instead of a fixed dollar amount
+ENTRY_THRESHOLD = 93          # minimum yes_bid/no_bid cents to consider (was exact == 93)
+RISK_PCT = 0.01               # flat risk per trade
+ORDER_POLL_SECONDS = 3        # how many 1s polls to wait for a fill before canceling the rest
+WICK_MIN_PCT = 0.00015        # min rejection-wick size as a % of BTC price (~$15 at $100k BTC)
+MAX_ENTRY_THRESHOLD = 97      # never take a fresh entry priced above this -- 98-99c entries are intentionally excluded
+STOP_CONFIRM_LOOPS = 3        # consecutive loops (~1s each) the FULL stop condition must hold before it actually fires
+HIGH_ENTRY_STOP_THRESHOLD = 97            # entries at/above this price get a widened % stop (see below)
+HIGH_ENTRY_STOP_LOSS_PCT = 0.375          # 35-40% stop for high-probability (>=97c) entries, vs. the normal 20%
+HIGH_ENTRY_STOP_FLOOR_CENTS = 67          # the widened stop never triggers above this hard cents floor (~65-70c)
+HIGH_ENTRY_STOP_DISABLE_THRESHOLD = 96    # entries at/above this price...
+HIGH_ENTRY_STOP_DISABLE_TIME_LEFT_MIN = 1.75  # ...have the stop fully disabled once time_left drops below this
+BTC_STOP_CONFIRM_FRACTION = 0.5           # live BTC must have reversed >= this fraction of its original entry-time
+                                           # distance from window-open before a stop is allowed to fire
 OVERRIDE_TRIGGERED = False
 SESSION_PNL = 0.00
-LAST_FILTER_CHECK = None   # most recent done-deal filter evaluation, for status.json
+LAST_FILTER_CHECK = None      # most recent done-deal filter evaluation, for status.json
 
 # ====================== TRADING SCHEDULE ======================
-# Previously "get_dynamic_risk": every window returned the same 0.01 risk
-# fraction anyway, so the per-window risk return was dead weight. Risk is
-# now the flat RISK_PCT constant above; this function keeps exactly the
-# same window schedule and just returns whether "now" falls inside one.
+# 24/7 version: always in a trading window.
 def in_trading_window():
-    tz = pytz.timezone("US/Eastern")
-    now = datetime.now(tz)
-    day = now.weekday() # 0=Mon, 1=Tue, ..., 5=Sat, 6=Sun
-    hour = now.hour
-    minute = now.minute
-    time_float = hour + (minute / 60.0)
-
-    # --- MONDAY through FRIDAY ---
-    if 0 <= day <= 4:
-        if 0.0 <= time_float < 5.0: return True    # Safe Overnights
-        if 5.0 <= time_float < 8.5: return True    # Safe / Low Priority
-        if 10.5 <= time_float < 12.0: return True  # High Confidence
-        if 12.0 <= time_float < 16.0: return True  # Balanced Midday
-        if 16.5 <= time_float < 17.5: return True  # Primary Window
-        if 22.0 <= time_float < 24.0: return True  # Asian Open
-
-    # --- SUNDAY ---
-    # Extended to the full 24 hours (was 12:00-17:00). Walk-forward
-    # validated: +25.4% PnL vs the original window on a blind first-half
-    # backtest, +22.1% on the held-out second half, and unlike every other
-    # schedule variant tested (adding Saturday, filling the weekday gaps,
-    # full 24/7) it never triggered a STRIKE_LIMIT halt in either half or
-    # the full 90-day period. See Mystic-Bot.md for the full analysis.
-    elif day == 6:
-        return True
-
-    return False
+    return True
 
 # ====================== HELPERS ======================
 def log(msg: str):
     ts = datetime.now(pytz.timezone("US/Eastern")).strftime("%Y-%m-%d %H:%M:%S ET")
     print(f"\n[{ts}] {msg}")
-    with open(LOG_FILE, "a", encoding="utf-8") as f: f.write(f"[{ts}] {msg}\n")
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"[{ts}] {msg}\n")
 
 def write_heartbeat():
-    """Writes a timestamp every loop pass, independent of log().
-    log() only fires on specific events (entries, exits, errors), so during
-    quiet or off-window periods log.txt can go stale for a long time even
-    while the bot is running fine — this file is what the dashboard should
-    use to detect liveness instead."""
     try:
         with open(HEARTBEAT_FILE, "w", encoding="utf-8") as f:
             f.write(datetime.now(pytz.timezone("US/Eastern")).isoformat())
@@ -124,8 +100,6 @@ def load_state():
     return {"strikes": 0, "current_trade": None}
 
 def write_json_atomic(path, data):
-    """Write-to-temp-then-replace so a crash mid-write never leaves a
-    truncated/corrupt file behind."""
     tmp_path = path + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
@@ -135,12 +109,6 @@ def save_state(state):
     write_json_atomic(STATE_FILE, state)
 
 def write_status(payload):
-    """Writes a snapshot of what the bot is currently seeing — market being
-    watched, current bid prices, whether it's in a trading window, and the
-    last done-deal filter evaluation. Separate from log.txt on purpose: log.txt is
-    for events (entries/exits/errors), this is for 'is it actually looking
-    right now' — updated every loop pass without spamming either the log or
-    the console."""
     try:
         write_json_atomic(STATUS_FILE, payload)
     except Exception:
@@ -157,7 +125,8 @@ def update_trades_json(trade_entry):
                 log(f"⚠️ trades.json parse error, starting fresh log: {e}")
                 trades = []
     trades.append(trade_entry)
-    with open(TRADES_FILE, "w", encoding="utf-8") as f: json.dump(trades, f, indent=2)
+    with open(TRADES_FILE, "w", encoding="utf-8") as f:
+        json.dump(trades, f, indent=2)
 
 def safe_price_cents(value) -> int:
     try:
@@ -167,22 +136,25 @@ def safe_price_cents(value) -> int:
         return 0
 
 def play_sound(event_type):
-    if not HAS_WINDOWS: return
-    s = {"buy":[(2000,200)], "settle_win":[(2500,200),(3000,200)], "settle_loss":[(600,500)], "stop":[(400,1000)]}
-    for f, d in s.get(event_type, []): winsound.Beep(f, d)
+    if not HAS_WINDOWS:
+        return
+    s = {
+        "buy": [(2000, 200)],
+        "settle_win": [(2500, 200), (3000, 200)],
+        "settle_loss": [(600, 500)],
+        "stop": [(400, 1000)],
+    }
+    for f, d in s.get(event_type, []):
+        winsound.Beep(f, d)
 
 # ====================== BTC PRICE HELPERS (for done-deal filters) ======================
 _last_klines_error_log_ts = 0.0
-KLINES_ERROR_LOG_THROTTLE_SECONDS = 30  # avoid flooding log.txt when the endpoint is down/blocked
+KLINES_ERROR_LOG_THROTTLE_SECONDS = 30
 
 def get_btc_klines(limit=25):
     """
     Fetch recent 1-min BTCUSDT candles from Binance's public market-data
-    endpoint. Uses data-api.binance.vision rather than api.binance.com —
-    the latter returns HTTP 451 for US-originating requests (Binance
-    geo-blocks api.binance.com for US IPs under its Terms of Use).
-    data-api.binance.vision is Binance's own documented endpoint for
-    public market data and isn't subject to that restriction.
+    endpoint. Uses data-api.binance.vision (US-friendly) rather than api.binance.com.
     """
     global _last_klines_error_log_ts
     try:
@@ -215,27 +187,22 @@ def get_window_open_price(close_time, klines):
     return None
 
 def required_distance_pct(time_left_min: float) -> float:
-    """Time-adjusted minimum % move from open to consider 'done deal'."""
+    """Time-adjusted minimum % move from open to consider 'done deal' (slightly loosened)."""
     if time_left_min > 3.5:
-        return 0.12   # need bigger move earlier
+        return 0.10
     elif time_left_min > 2.5:
-        return 0.08
+        return 0.06
     else:
-        return 0.05
+        return 0.06  # was 0.04 -- the marginal late-window entries at 0.04-0.05% were too easily flash-triggered
 
 def check_momentum_and_wick(klines, direction: str, ref_price: float) -> bool:
     """
     direction = 'up' or 'down'
-    ref_price = current BTC reference price, used to scale the wick-rejection
-    threshold as a % of price (WICK_MIN_PCT) instead of a fixed dollar amount,
-    so the filter stays meaningful regardless of what BTC is trading at.
-
     Returns True if short-term momentum is still aligned AND no large opposing wick
     in the last ~2 minutes.
     """
     if len(klines) < 5:
         return False
-    # Last 3 closed candles (ignore the forming one)
     recent = klines[-4:-1]  # previous 3 completed 1m candles
     if len(recent) < 3:
         return False
@@ -245,7 +212,6 @@ def check_momentum_and_wick(klines, direction: str, ref_price: float) -> bool:
     lows   = [float(c[3]) for c in recent]
     opens  = [float(c[1]) for c in recent]
 
-    # Momentum: net direction of last 3 closes
     net_move = closes[-1] - closes[0]
     if direction == "up" and net_move <= 0:
         return False
@@ -254,42 +220,65 @@ def check_momentum_and_wick(klines, direction: str, ref_price: float) -> bool:
 
     min_wick_dollars = ref_price * WICK_MIN_PCT
 
-    # Opposing wick check (last 2 candles)
     for i in range(-2, 0):
         body = abs(closes[i] - opens[i])
         if body < 1e-8:
             body = 1e-8
         if direction == "up":
-            # large lower wick relative to body = potential rejection of upside
             lower_wick = min(opens[i], closes[i]) - lows[i]
             if lower_wick > body * 2.5 and lower_wick > min_wick_dollars:
                 return False
         else:
-            # large upper wick relative to body
             upper_wick = highs[i] - max(opens[i], closes[i])
             if upper_wick > body * 2.5 and upper_wick > min_wick_dollars:
                 return False
     return True
 
+def btc_confirms_stop(curr):
+    """
+    Guard against firing a stop-loss purely off a Kalshi order-book spike:
+    only allow it if live BTC price has also closed back at least
+    BTC_STOP_CONFIRM_FRACTION of its original entry-time distance from the
+    window-open reference price. A pure book flash crash with BTC still
+    well on our side should not force an exit.
+    """
+    entry_btc_price = curr.get("entry_btc_price")
+    entry_open_px = curr.get("entry_open_px")
+    entry_direction = curr.get("entry_direction")
+    if entry_btc_price is None or entry_open_px is None or entry_direction is None:
+        # Trade opened before this field existed, or entry-time BTC context
+        # wasn't captured for some other reason -- fail safe and allow the
+        # stop rather than silently blocking it forever.
+        return True
+
+    klines = get_btc_klines(limit=5)
+    if not klines:
+        return True  # can't confirm without fresh data -- fail safe, allow the stop
+    now_px = float(klines[-1][4])
+
+    original_distance = abs(entry_btc_price - entry_open_px)
+    if original_distance <= 0:
+        return True
+
+    if entry_direction == "up":
+        reversal = entry_btc_price - now_px   # positive = BTC has fallen back
+    else:
+        reversal = now_px - entry_btc_price   # positive = BTC has risen back
+
+    return (reversal / original_distance) >= BTC_STOP_CONFIRM_FRACTION
+
 # ====================== API SETUP ======================
-with open(APIKEY_FILE, "r", encoding="utf-8") as f: api_key_id = f.read().strip()
-with open(PRIVATE_FILE, "r", encoding="utf-8") as f: private_key_pem = f.read()
+with open(APIKEY_FILE, "r", encoding="utf-8") as f:
+    api_key_id = f.read().strip()
+with open(PRIVATE_FILE, "r", encoding="utf-8") as f:
+    private_key_pem = f.read()
 
 config = Configuration(host="https://api.elections.kalshi.com/trade-api/v2")
 config.api_key_id = api_key_id
 config.private_key_pem = private_key_pem
 client = KalshiClient(config)
 
-# Kalshi's V2 orders endpoint (client.create_order_v2 / cancel_order_v2) quotes
-# everything from the YES leg only: "bid" = buy YES, "ask" = sell YES. Buying
-# or selling NO is expressed as the complementary trade on YES at (100 - price)
-# cents. This bot reasons in yes/no terms everywhere else (state.json, trades,
-# the dashboard, the filters) — the conversion happens only here, right at the
-# API boundary, so nothing else needs to change.
-# Source: kalshi_python_sync 3.23.0's BookSide docstring — "For event markets,
-# this refers to the YES leg only: bid means buy YES, ask means sell YES.
-# (Selling YES is economically equivalent to buying NO at 1 - price...)"
-SELF_TRADE_PREVENTION_TYPE = "taker_at_cross"  # cancels our own taker order rather than crossing our own resting order
+SELF_TRADE_PREVENTION_TYPE = "taker_at_cross"
 
 def _to_book_order(side, action, price_cents):
     if side == "yes":
@@ -301,29 +290,6 @@ def _to_book_order(side, action, price_cents):
     return book_side, book_price_cents
 
 def place_order(ticker, side, count, action, price_cents=None):
-    """
-    Places a limit order via Kalshi's V2 orders endpoint and confirms its
-    fill status by polling the order directly by its exchange order_id. If
-    the order hasn't fully filled within ORDER_POLL_SECONDS, cancels
-    whatever remains resting so nothing is left unmanaged on the book.
-
-    V2's contract counts and prices are fixed-point decimal strings (e.g.
-    "1.00", "0.97") rather than the ints/cents the old V1 endpoint used —
-    converted at this boundary so the rest of the bot keeps working in
-    plain integers and cents throughout.
-
-    Returns the number of contracts actually filled (0 if none). Callers
-    should treat this as a partial-fill-aware count, not a boolean.
-
-    In SHADOW_MODE, never calls the real Kalshi order API -- simulates a
-    full fill at the requested price_cents (the same optimistic-fill
-    assumption used throughout this project's backtesting) and deducts
-    the real published taker fee from the shadow cash ledger. Position
-    PnL itself (the price-difference component) is applied by the caller
-    at settlement/stop-loss time, same as in real mode -- this function
-    only ever handles the fee, so its contract (return a fill count) stays
-    identical in both modes and no caller needs to know which mode is active.
-    """
     if SHADOW_MODE:
         fee = shadow_taker_fee_dollars(price_cents, count)
         state = load_state()
@@ -361,9 +327,6 @@ def place_order(ticker, side, count, action, price_cents=None):
         if filled < count:
             try:
                 client.cancel_order_v2(exchange_order_id)
-                # cancel_order_v2's response carries reduced_by, not a total
-                # fill count — re-read the order directly for the
-                # authoritative final count.
                 o = client.get_order(exchange_order_id).order
                 filled = int(round(float(o.fill_count_fp)))
             except Exception as ce:
@@ -377,21 +340,6 @@ def place_order(ticker, side, count, action, price_cents=None):
 POSITION_QTY_KEYS = ("position_fp", "position", "net_position", "quantity", "count")
 
 def _extract_position_qty(p):
-    """
-    Reads a position-size value off a MarketPosition object. Confirmed
-    against kalshi_python_sync 3.23.0's actual source: the field is
-    `position_fp`, a fixed-point decimal STRING (e.g. "5.00" / "-3.00"),
-    not a plain int named `position` like older SDK versions used. Sign
-    convention (positive=YES, negative=NO) is inferred from the rest of the
-    V2 schema's YES-relative design, not explicitly restated on this field —
-    worth double-checking against a real open position if anything looks off.
-
-    Falls back through a few other plausible names in case of yet another
-    version drift, and always returns the raw field dict so an unrecognized
-    shape can be logged rather than silently misread.
-
-    Returns (qty, raw_fields_dict). qty is None if nothing matched/parsed.
-    """
     raw = {}
     try:
         raw = dict(vars(p))
@@ -406,15 +354,6 @@ def _extract_position_qty(p):
     return None, raw
 
 def reconcile_state_with_positions(state):
-    """
-    One-time startup check: verifies state.json's current_trade actually
-    matches a live Kalshi position. Protects against a stale/desynced state
-    file after a crash, manual kill, or restart mid-trade.
-
-    If the position-size field can't be read at all (schema mismatch),
-    this logs the real field names it found and leaves state.json alone
-    rather than risk wiping out a real open position based on a bad read.
-    """
     try:
         curr = state.get("current_trade")
         positions_resp = client.get_positions()
@@ -465,7 +404,7 @@ def reconcile_state_with_positions(state):
 
 # ====================== MAIN LOOP ======================
 if __name__ == "__main__":
-    log(f"🪄 {BOT_NAME} Active ({ENTRY_THRESHOLD}c Done-Deal Filters + New Schedule)")
+    log(f"🪄 {BOT_NAME} Active ({ENTRY_THRESHOLD}-{MAX_ENTRY_THRESHOLD}c Done-Deal Filters · 24/7 · loosened time/distance)")
     if SHADOW_MODE:
         log(f"🌗 SHADOW MODE: simulated fills only, no real orders. Starting cash: ${_args.shadow_cash:.2f}. "
             f"Writing to {os.path.basename(STATE_FILE)} / {os.path.basename(LOG_FILE)} / "
@@ -473,7 +412,7 @@ if __name__ == "__main__":
 
     state = load_state()
     if not SHADOW_MODE:
-        state = reconcile_state_with_positions(state)  # meaningless in shadow mode -- no real positions exist to reconcile against
+        state = reconcile_state_with_positions(state)
 
     while True:
         try:
@@ -481,8 +420,10 @@ if __name__ == "__main__":
 
             if HAS_WINDOWS and msvcrt.kbhit():
                 key = msvcrt.getch()
-                if key == b'\x1b': os._exit(0)
-                elif key.lower() == b'c': OVERRIDE_TRIGGERED = True
+                if key == b'\x1b':
+                    os._exit(0)
+                elif key.lower() == b'c':
+                    OVERRIDE_TRIGGERED = True
 
             now_et = datetime.now(pytz.timezone("US/Eastern"))
             state = load_state()
@@ -493,10 +434,6 @@ if __name__ == "__main__":
             curr = state.get("current_trade")
             is_trading_window = in_trading_window()
 
-            # Trailing safety floor: never allow more than a (1 - SAFETY_FLOOR_PCT)
-            # drawdown from the highest balance ever observed -- persisted in
-            # state.json so it survives restarts, and ratchets up with every
-            # new high instead of becoming irrelevant after a good run.
             peak_cash = max(state.get("peak_cash") or cash, cash)
             if peak_cash != state.get("peak_cash"):
                 state["peak_cash"] = peak_cash
@@ -504,11 +441,14 @@ if __name__ == "__main__":
             safety_floor = peak_cash * SAFETY_FLOOR_PCT
 
             if OVERRIDE_TRIGGERED:
-                log("🛠️ Manual Override: Clearing State"); state["current_trade"] = None
-                save_state(state); OVERRIDE_TRIGGERED = False
+                log("🛠️ Manual Override: Clearing State")
+                state["current_trade"] = None
+                save_state(state)
+                OVERRIDE_TRIGGERED = False
 
             if cash <= safety_floor or state.get("strikes", 0) >= STRIKE_LIMIT:
-                log(f"🚨 Shutdown: Cash ${cash:.2f} | Floor ${safety_floor:.2f} ({int(SAFETY_FLOOR_PCT*100)}% of peak ${peak_cash:.2f}) | Strikes {state.get('strikes')}"); break
+                log(f"🚨 Shutdown: Cash ${cash:.2f} | Floor ${safety_floor:.2f} ({int(SAFETY_FLOOR_PCT*100)}% of peak ${peak_cash:.2f}) | Strikes {state.get('strikes')}")
+                break
 
             # --- TICKER FETCH ---
             resp = client.get_markets(series_ticker="KXBTC15M", limit=5, status="open")
@@ -521,21 +461,56 @@ if __name__ == "__main__":
                 y_p, n_p = safe_price_cents(market.yes_bid_dollars), safe_price_cents(market.no_bid_dollars)
             else:
                 time_left = 0
+                y_p = n_p = 0
 
             # --- MONITORING / STOP LOSS ---
             if curr and curr.get("status") == "filled":
                 m_live = client.get_market(curr['ticker']).market
                 live_bid = safe_price_cents(m_live.yes_bid_dollars if curr['side'] == "yes" else m_live.no_bid_dollars)
                 entry_p = curr['entry_price_cents']
-                stop_p = entry_p * (1 - STOP_LOSS_THRESHOLD)
 
-                # Stability Check: Stop Loss disabled in final 30 seconds
-                if 0 < live_bid <= stop_p and time_left > 0.5:
-                    log(f"🚨 STOP LOSS: Selling {curr['ticker']}")
+                # Widened stop for high-probability (>=HIGH_ENTRY_STOP_THRESHOLD) entries:
+                # a much wider % stop, but never let it trigger above a hard cents floor.
+                if entry_p >= HIGH_ENTRY_STOP_THRESHOLD:
+                    stop_p = max(entry_p * (1 - HIGH_ENTRY_STOP_LOSS_PCT), HIGH_ENTRY_STOP_FLOOR_CENTS)
+                else:
+                    stop_p = entry_p * (1 - STOP_LOSS_THRESHOLD)
+
+                # Stop fully disabled in the closing seconds for everyone, and disabled
+                # earlier (<HIGH_ENTRY_STOP_DISABLE_TIME_LEFT_MIN) for very high-probability
+                # entries -- those are the ones most likely to be a pure late-window flash spike.
+                stop_disabled = (time_left <= 0.5) or (
+                    entry_p >= HIGH_ENTRY_STOP_DISABLE_THRESHOLD
+                    and time_left < HIGH_ENTRY_STOP_DISABLE_TIME_LEFT_MIN
+                )
+
+                price_breached = (0 < live_bid <= stop_p) and not stop_disabled
+
+                if price_breached and btc_confirms_stop(curr):
+                    # Require the FULL stop condition (price breach + BTC confirmation) to
+                    # hold for STOP_CONFIRM_LOOPS consecutive loops (~STOP_CONFIRM_LOOPS
+                    # seconds) before actually firing -- filters out single-poll flash spikes.
+                    curr['stop_breach_count'] = curr.get('stop_breach_count', 0) + 1
+                    state['current_trade'] = curr
+                    save_state(state)
+                elif curr.get('stop_breach_count', 0):
+                    curr['stop_breach_count'] = 0
+                    state['current_trade'] = curr
+                    save_state(state)
+
+                if curr.get('stop_breach_count', 0) >= STOP_CONFIRM_LOOPS:
+                    log(f"🚨 STOP LOSS: Selling {curr['ticker']} (confirmed over {STOP_CONFIRM_LOOPS} consecutive polls)")
                     filled = place_order(curr['ticker'], curr['side'], curr['count'], "sell", live_bid)
                     if filled > 0:
                         pnl = (live_bid - entry_p) * filled / 100.0
-                        update_trades_json({"timestamp": now_et.strftime("%Y-%m-%d %H:%M:%S"), "ticker": curr['ticker'], "side": curr['side'], "pnl": round(pnl, 2), "type": "STOP_LOSS", "count": filled})
+                        update_trades_json({
+                            "timestamp": now_et.strftime("%Y-%m-%d %H:%M:%S"),
+                            "ticker": curr['ticker'],
+                            "side": curr['side'],
+                            "pnl": round(pnl, 2),
+                            "type": "STOP_LOSS",
+                            "count": filled,
+                        })
                         SESSION_PNL += pnl
                         if SHADOW_MODE:
                             state["shadow_cash"] = state.get("shadow_cash", _args.shadow_cash) + pnl
@@ -544,13 +519,16 @@ if __name__ == "__main__":
                         else:
                             log(f"⚠️ Stop-loss partially filled ({filled}/{curr['count']}). {curr['count'] - filled} contracts still open.")
                             curr['count'] -= filled
+                            curr['stop_breach_count'] = 0
                             state["current_trade"] = curr
                         state["strikes"] += 1
-                        save_state(state); play_sound("stop"); continue
+                        save_state(state)
+                        play_sound("stop")
+                        continue
                     else:
                         log(f"⚠️ Stop-loss order for {curr['ticker']} did not fill. Will reassess next loop.")
 
-            # --- HEARTBEAT ---
+            # --- HEARTBEAT / STATUS ---
             status_text = f" [IN: {curr['side'].upper()} @ {curr['entry_price_cents']}c]" if curr else ""
             print(f"\r[{now_et.strftime('%H:%M:%S')}] Risk: {int(RISK_PCT*100)}% | Cash: ${cash:.2f} | Session: ${SESSION_PNL:+.2f}{status_text}", end="")
 
@@ -563,6 +541,7 @@ if __name__ == "__main__":
                 "safety_floor": round(safety_floor, 2),
                 "risk_pct": round(RISK_PCT * 100, 1),
                 "entry_threshold": ENTRY_THRESHOLD,
+                "max_entry_threshold": MAX_ENTRY_THRESHOLD,
                 "is_trading_window": is_trading_window,
                 "current_trade": curr,
                 "market": {
@@ -570,15 +549,20 @@ if __name__ == "__main__":
                     "time_left_min": round(time_left, 2),
                     "yes_bid": y_p,
                     "no_bid": n_p,
-                    "watching_97c": (y_p == ENTRY_THRESHOLD or n_p == ENTRY_THRESHOLD),  # key name kept for dashboard compatibility; value now reflects ENTRY_THRESHOLD, not literally 97
+                    "watching_threshold": (
+                        (ENTRY_THRESHOLD <= y_p <= MAX_ENTRY_THRESHOLD)
+                        or (ENTRY_THRESHOLD <= n_p <= MAX_ENTRY_THRESHOLD)
+                    ),
                 } if markets else None,
                 "last_filter_check": LAST_FILTER_CHECK,
             })
 
             if not is_trading_window and not curr:
-                time.sleep(10); continue
+                time.sleep(10)
+                continue
             if not markets:
-                time.sleep(5); continue
+                time.sleep(5)
+                continue
 
             # --- SETTLEMENT CHECK ---
             if curr and market.ticker != curr["ticker"]:
@@ -588,23 +572,37 @@ if __name__ == "__main__":
                 if res in ['yes', 'no']:
                     won = (curr['side'] == res)
                     pnl = (100 - curr['entry_price_cents']) * curr['count'] / 100.0 if won else -(curr['entry_price_cents'] * curr['count'] / 100.0)
-                    update_trades_json({"timestamp": now_et.strftime("%Y-%m-%d %H:%M:%S"), "ticker": curr['ticker'], "side": curr['side'], "pnl": round(pnl, 2), "type": "SETTLEMENT"})
+                    update_trades_json({
+                        "timestamp": now_et.strftime("%Y-%m-%d %H:%M:%S"),
+                        "ticker": curr['ticker'],
+                        "side": curr['side'],
+                        "pnl": round(pnl, 2),
+                        "type": "SETTLEMENT",
+                    })
                     SESSION_PNL += pnl
                     if SHADOW_MODE:
                         state["shadow_cash"] = state.get("shadow_cash", _args.shadow_cash) + pnl
                     log(f"🏁 RESULT: {res.upper()} | {'WIN' if won else 'LOSS'} | PnL: ${pnl:+.2f}")
                     state["strikes"] = 0 if won else state.get("strikes", 0) + 1
-                    state["current_trade"] = None; save_state(state)
+                    state["current_trade"] = None
+                    save_state(state)
                     play_sound("settle_win" if won else "settle_loss")
-                # Loop back immediately so the next iteration re-fetches markets,
-                # cash, and prices fresh rather than reusing values computed
-                # before this 35s blocking sleep.
                 continue
 
-            # --- ENTRY (Exactly ENTRY_THRESHOLD cents + Done-Deal Filters) ---
+            # --- ENTRY (≥ ENTRY_THRESHOLD + Done-Deal Filters) ---
             elif not curr and is_trading_window:
-                if 2.0 <= time_left <= 4.0 and (y_p == ENTRY_THRESHOLD or n_p == ENTRY_THRESHOLD):
-                    side, price = ("yes", y_p) if y_p == ENTRY_THRESHOLD else ("no", n_p)
+                # Widened time band + accept any bid >= threshold (not exact equality),
+                # but never above MAX_ENTRY_THRESHOLD -- 98-99c entries are intentionally excluded.
+                y_qualifies = ENTRY_THRESHOLD <= y_p <= MAX_ENTRY_THRESHOLD
+                n_qualifies = ENTRY_THRESHOLD <= n_p <= MAX_ENTRY_THRESHOLD
+                if 1.75 <= time_left <= 4.5 and (y_qualifies or n_qualifies):
+                    # Prefer the higher of the two sides if both qualify
+                    if y_qualifies and n_qualifies:
+                        side, price = ("yes", y_p) if y_p >= n_p else ("no", n_p)
+                    elif y_qualifies:
+                        side, price = "yes", y_p
+                    else:
+                        side, price = "no", n_p
 
                     # === Done-deal filters ===
                     klines = get_btc_klines(limit=25)
@@ -618,10 +616,8 @@ if __name__ == "__main__":
                         dist_pct = abs(current_px - open_px) / open_px * 100.0
                         req_pct = required_distance_pct(time_left)
 
-                        # Determine price direction from open
                         price_dir = "up" if current_px > open_px else "down"
 
-                        # Require large enough move + aligned momentum + no large opposing wick
                         if dist_pct >= req_pct:
                             if check_momentum_and_wick(klines, price_dir, current_px):
                                 filters_ok = True
@@ -650,8 +646,18 @@ if __name__ == "__main__":
                             if filled > 0:
                                 if filled < qty:
                                     log(f"⚠️ Partial fill on entry: {filled}/{qty} contracts.")
-                                state["current_trade"] = {"ticker": market.ticker, "side": side, "count": filled, "entry_price_cents": price, "status": "filled"}
-                                save_state(state); play_sound("buy")
+                                state["current_trade"] = {
+                                    "ticker": market.ticker,
+                                    "side": side,
+                                    "count": filled,
+                                    "entry_price_cents": price,
+                                    "status": "filled",
+                                    "entry_btc_price": current_px,
+                                    "entry_open_px": open_px,
+                                    "entry_direction": price_dir,
+                                }
+                                save_state(state)
+                                play_sound("buy")
                                 time.sleep(5)
                             else:
                                 log("⚠️ Entry failed (no fill). 15s Cooldown...")
@@ -665,13 +671,7 @@ if __name__ == "__main__":
                             LAST_FILTER_CHECK["filters_ok"] = False
                             LAST_FILTER_CHECK["reason"] = skip_reason
                     else:
-                        # Every touch that gets this far is a real, rare event (this
-                        # is the rarest signal in the whole strategy) -- log it
-                        # permanently rather than only in status.json's
-                        # last_filter_check, which gets overwritten every loop and
-                        # can't answer "how many touches happened and why were they
-                        # all rejected" after the fact.
-                        log(f"⏭ Skip {ENTRY_THRESHOLD}c {side.upper()}: {reason}")
+                        log(f"⏭ Skip ≥{ENTRY_THRESHOLD}c {side.upper()} @ {price}c: {reason}")
 
             time.sleep(1)
         except Exception as e:
