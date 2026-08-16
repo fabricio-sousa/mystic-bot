@@ -1,110 +1,122 @@
-# Mystic-Bot
+# Mystic-Bot 1.0
 
-Automated trading bot for Kalshi's `KXBTC15M` series (15-minute Bitcoin up/down binary contracts), using a late-window "Done-Deal" entry confirmed by BTC momentum filters. Includes a read-only web dashboard for monitoring.
+Automated trading bot for Kalshi's `KXBTC15M` 15-minute Bitcoin price markets.
+Runs 24/7, enters near the close of each window when "done-deal" filters
+agree the outcome is effectively decided, and manages the position with a
+stop-loss until settlement.
 
-For the full history of how the current configuration was chosen — backtesting methodology, parameter sweeps, the forensic investigation into specific losing streaks, and the walk-forward validation — see **`Mystic-Bot.md`**. This file only covers running the bot itself.
+> No README existed in this repo before this change, so this file was
+> written from scratch based on the current source. If you already keep
+> docs elsewhere, treat this as a starting point to merge in rather than
+> the source of truth.
 
-## Strategy, in brief
+## Requirements
 
-Every 15-minute BTC window, the bot watches for the yes/no bid to be at or above `ENTRY_THRESHOLD` cents (currently 93¢) and no higher than `MAX_ENTRY_THRESHOLD` (97¢ — 98-99¢ touches are intentionally skipped), with 2-4 minutes left before close. If it does, three additional filters must all pass before entering:
-
-- **Distance**: BTC has moved far enough from the window's opening price (threshold scales with time remaining)
-- **Momentum**: the last 3 completed 1-minute candles are trending in the same direction
-- **Wick**: no recent candle has a large opposing wick (a rejection signal)
-
-One position at a time. A stop-loss exits early if the position's own bid drops `STOP_LOSS_THRESHOLD` (20%) below entry — widened to `HIGH_ENTRY_STOP_LOSS_PCT` (37.5%), floor-capped at a hard `HIGH_ENTRY_STOP_FLOOR_CENTS` (67¢), for entries at/above `HIGH_ENTRY_STOP_THRESHOLD` (97¢), and fully disabled inside the final `HIGH_ENTRY_STOP_DISABLE_TIME_LEFT_MIN` (1.75) minutes for entries at/above `HIGH_ENTRY_STOP_DISABLE_THRESHOLD` (96¢) — on top of the existing disable in everyone's final 30 seconds. Two more conditions have to hold before a stop is actually allowed to fire: the breach must persist for `STOP_CONFIRM_LOOPS` (3) consecutive ~1-second polls, and live BTC must have reversed at least `BTC_STOP_CONFIRM_FRACTION` (50%) of its original entry-time distance from the window's open price. Both exist to tell a genuine reversal apart from a pure Kalshi order-book flash spike. The bot halts entirely if cash falls to `SAFETY_FLOOR_PCT` of its highest balance ever reached, or three non-winning trades happen in a row with no win in between (`STRIKE_LIMIT`).
-
-## Setup
-
-```
-pip install kalshi_python_sync requests pytz
-pip install flask          # dashboard only
-```
-
-Place in the bot's folder:
-- `apikey.txt` — your Kalshi API key ID
-- `private.txt` — your Kalshi private key (PEM)
-
-Windows-only: desktop alert sounds use `winsound`/`msvcrt` and are skipped automatically on other platforms.
+- Python 3.9+
+- `pytz`, `requests`, `kalshi_python_sync`
+- `apikey.txt` and `private.txt` in the same directory as `bot.py` (Kalshi
+  API key ID and private key PEM). These are read in both live and shadow
+  mode, since shadow mode still needs real market data.
+- Windows only, for the beep-on-event / hotkey-override features
+  (`winsound`, `msvcrt`); the bot still runs on other platforms with those
+  disabled.
 
 ## Running
 
-```
+```bash
+# Live trading
 python bot.py
+
+# Shadow mode: simulated fills, no real orders, separate shadow_*.json/log files
+python bot.py --shadow --shadow-cash 1000
+
+# Shadow mode with pessimistic fills: re-quotes the book at order time and
+# only "fills" if the order would actually still cross it, at the refreshed
+# price. Requires --shadow. This is the fill model closest to live behavior;
+# plain shadow mode fills unconditionally at the signal price and overstates
+# performance.
+python bot.py --shadow --shadow-cash 1000 --shadow-pessimistic
 ```
 
-Runs until stopped (Esc) or until a shutdown condition fires. Press `c` at any time to clear the current tracked position from `state.json` (manual override — use if you've closed a position by hand on Kalshi and the bot's state has drifted from reality).
+Shadow mode writes to `shadow_state.json` / `shadow_log.txt` /
+`shadow_trades.json` / `shadow_status.json`, entirely separate from the live
+instance's files, so both can point at the same directory without
+colliding — but note `--shadow-cash` only seeds `shadow_cash` the *first*
+time (when the key is absent from `shadow_state.json`). If you want a clean
+balance for a new test, delete or move the old state file first, or the
+flag is silently ignored.
 
-### Shadow mode
+If you want two shadow variants running at once for comparison (e.g.
+optimistic vs. pessimistic fill models), give each its own directory with
+its own copy of `bot.py` and the credential files — `_prefix` is
+`"shadow_"` for both, so two instances in the same folder will read and
+write each other's state.
 
-```
-python bot.py --shadow --shadow-cash 5000
-```
+## Entry logic
 
-Runs the exact same live market data, filters, and decision logic as real trading, but never places a real order — fills are simulated at the observed live price with Kalshi's real published taker fee applied, tracked in its own ledger (`shadow_cash`, inside `shadow_state.json`). Safe to run **at the same time**, in the same folder, as a real instance — it reads/writes an entirely separate set of files (`shadow_state.json`, `shadow_trades.json`, `shadow_log.txt`, `shadow_status.json`, `shadow_heartbeat.txt`), so the two never collide. `--shadow-cash` sets the starting simulated balance (default 5000) and only matters for shadow mode.
+- Only considers the nearest-expiry open `KXBTC15M` market.
+- Entry window: 1.75–4.5 minutes before close.
+- Entry price is read off the **ask** (what you'd actually pay), not the
+  bid — `market_asks()` derives it from the API's ask field when present,
+  falling back to `100 - opposite_side_bid` since yes/no share one book.
+- Qualifies only if that ask is between `ENTRY_THRESHOLD` (93c) and
+  `MAX_ENTRY_THRESHOLD` (95c) inclusive.
+- Must also pass the "done-deal" filters: BTC has moved far enough from the
+  window's open price for the time remaining (`required_distance_pct`),
+  and recent momentum/wick shape confirms the move isn't about to reverse
+  (`check_momentum_and_wick`).
+- Position size: `min(MAX_POSITION_DOLLARS, cash * RISK_PCT)` dollars,
+  converted to contracts at the entry price. At $1000 cash and 1% risk
+  that's ~10 contracts per trade; scales with cash as it grows or shrinks.
 
-What this does and doesn't tell you: shadow mode trades against *today's* live market rather than a frozen historical backtest window, so it's the only way to check whether an edge found in past data still exists right now. It does **not** simulate real order-book depth, slippage, or how other participants might react to a real order — a simulated fill at the observed price is still an optimistic assumption, just a live one instead of a historical one. Treat divergence between shadow and real-money results (once the real bot has enough size to compare meaningfully) as a direct, measurable read on how much that gap actually costs.
+## Exit logic
 
-```
-python dashboard.py
-```
+- **Stop-loss**: normally 20% below entry (`STOP_LOSS_THRESHOLD`). Requires
+  the price breach to hold for `STOP_CONFIRM_LOOPS` consecutive ~1s polls,
+  and requires live BTC price to have actually reversed
+  (`btc_confirms_stop`) before firing — filters out pure order-book flash
+  spikes that aren't backed by the underlying moving.
+- **Settlement**: when the market rolls to a new ticker, waits ~35s for the
+  prior window to finalize and records the result.
+- `HIGH_ENTRY_STOP_*` constants widen or fully disable the stop for
+  entries at 96–97c. **These are currently dormant** — with
+  `MAX_ENTRY_THRESHOLD = 95`, no entry can ever reach that price, so every
+  position uses the plain 20% stop. Left in place (not deleted) so raising
+  `MAX_ENTRY_THRESHOLD` back up later restores the old behavior without
+  re-deriving these values.
 
-Then open `http://localhost:5000`. Polls every 3 seconds. Read-only — never touches the Kalshi API or your credentials, only the files `bot.py` already writes. Safe to run alongside the bot at all times, including from a different machine pointed at a shared folder.
+## Risk controls
 
-For a shadow session, use `shadowdashboard.py` instead — same tool, pointed at the `shadow_*` files, running on port 5001 so it can sit alongside the real dashboard without conflict:
+| Control | Behavior |
+|---|---|
+| `SAFETY_FLOOR_PCT` (75%) | Bot **shuts down entirely** (process exits) if cash drops to 75% of the highest balance ever reached (trailing peak, not a fixed dollar figure). |
+| `STRIKE_LIMIT` (3) | Bot shuts down after 3 consecutive losing trades (win resets the counter). |
+| `MAX_DAILY_DRAWDOWN_PCT` (10%) | **New.** If today's cash drops 10% below today's opening cash, new entries pause until midnight ET. Any position already open keeps being monitored and can still stop out or settle normally — only new entries are blocked. |
 
-```
-python shadowdashboard.py
-```
+The daily drawdown pause is intentionally softer than the safety floor and
+strike limit: those two stop the bot outright, this one just waits out the
+rest of a bad day and resumes automatically. Baseline resets each ET
+calendar day; if the bot restarts mid-day, it keeps the existing baseline
+and pause state from `state.json` rather than treating the restart as a
+fresh day.
 
-Then open `http://localhost:5001`. Visually distinct on purpose (violet accent, a persistent "SHADOW MODE — SIMULATED, NO REAL MONEY" badge in the header) so the two are never confusable at a glance.
+`status.json` exposes `daily_start_cash`, `daily_drawdown_pct`,
+`daily_drawdown_limit_pct`, `is_daily_paused`, and `daily_paused_until` for
+any external dashboard, and the console heartbeat line shows the current
+daily drawdown and a `[DAILY DD PAUSE]` tag while paused.
 
-## Configuration
+## Known limitations
 
-All in the `CONFIG` section at the top of `bot.py`:
-
-| Constant | Current value | Meaning |
-|---|---|---|
-| `ENTRY_THRESHOLD` | 93 | Minimum cents-scale bid to consider for entry |
-| `MAX_ENTRY_THRESHOLD` | 97 | Maximum cents-scale bid to consider — 98-99¢ touches are skipped |
-| `STOP_LOSS_THRESHOLD` | 0.20 | Exit if bid drops this fraction below entry (entries below `HIGH_ENTRY_STOP_THRESHOLD`) |
-| `HIGH_ENTRY_STOP_THRESHOLD` | 97 | Entries at/above this price use the widened stop below instead of `STOP_LOSS_THRESHOLD` |
-| `HIGH_ENTRY_STOP_LOSS_PCT` | 0.375 | Widened stop-loss fraction for those high-probability entries |
-| `HIGH_ENTRY_STOP_FLOOR_CENTS` | 67 | The widened stop never triggers above this hard cents floor |
-| `HIGH_ENTRY_STOP_DISABLE_THRESHOLD` | 96 | Entries at/above this price get the stop fully disabled near expiry |
-| `HIGH_ENTRY_STOP_DISABLE_TIME_LEFT_MIN` | 1.75 | ...once `time_left` (minutes) drops below this |
-| `STOP_CONFIRM_LOOPS` | 3 | Consecutive ~1s polls the stop condition must hold before it actually fires |
-| `BTC_STOP_CONFIRM_FRACTION` | 0.5 | Live BTC must have reversed this fraction of its original entry-time distance from window-open before a stop is allowed to fire |
-| `RISK_PCT` | 0.01 | Flat fraction of cash risked per trade (all trading windows) |
-| `MAX_POSITION_DOLLARS` | 500.0 | Hard cap on position size regardless of `RISK_PCT × cash` |
-| `SAFETY_FLOOR_PCT` | 0.75 | Bot halts if cash falls to this fraction of the highest balance ever reached (trailing, not a fixed dollar amount) |
-| `STRIKE_LIMIT` | 3 | Bot halts after this many non-winning trades in a row |
-| `MAX_SLIPPAGE` | 1 | Cents of slippage tolerance on order placement |
-| `ORDER_POLL_SECONDS` | 3 | How long to wait for a fill before canceling the remainder |
-| `WICK_MIN_PCT` | 0.00015 | Minimum wick size (as % of BTC price) to count as a rejection |
-
-Trading windows (which hours of the week the bot is active at all) are set in `in_trading_window()`, just below the config block. Editing a window's hours doesn't require touching anything else — `RISK_PCT` applies uniformly across every window now (see `Mystic-Bot.md` for why this used to be a per-window value and isn't anymore).
-
-**A shutdown (`SAFETY_FLOOR` or `STRIKE_LIMIT`) is not self-recovering.** The bot exits its loop entirely and stays down until you notice and restart it manually. There is currently no auto-restart or external alerting beyond the dashboard's `ONLINE`/`OFFLINE` indicator (driven by `heartbeat.txt`) — worth having some way of noticing this yourself, especially early on.
-
-## Files it reads / writes
-
-All in the bot's own folder, alongside `bot.py`:
-
-| File | Written by | Purpose |
-|---|---|---|
-| `state.json` | bot | Current position + strike count. Source of truth across restarts. |
-| `trades.json` | bot | Full trade history (append-only) |
-| `log.txt` | bot | Human-readable event log (entries, exits, errors) — not a liveness signal, see below |
-| `heartbeat.txt` | bot | Rewritten every loop pass; this is what the dashboard uses to determine online/offline, since `log.txt` only updates on specific events and can go quiet for long stretches even while the bot is running fine |
-| `status.json` | bot | Live snapshot: market being watched, current bid prices, last filter evaluation, whether currently in a trading window |
-| `apikey.txt` / `private.txt` | you | Kalshi credentials — never written by the bot, never read by the dashboard |
-
-The dashboard only ever reads these files; it has no write access and makes no Kalshi API calls of its own.
-
-## Safety notes
-
-- The bot reconciles `state.json` against your actual live Kalshi positions on startup (`reconcile_state_with_positions`) — if it finds an untracked position, it logs a warning rather than guessing; check `log.txt` after any restart.
-- `place_order` handles partial fills — the entry logic will size and log accordingly rather than assume a full fill.
-- Stop-loss is explicitly disabled in a position's final 30 seconds (`time_left <= 0.5`), to avoid selling into a wide spread right before settlement — and, for high-probability entries specifically, disabled earlier still (see `HIGH_ENTRY_STOP_DISABLE_*` above).
-- A stop-loss breach must persist for `STOP_CONFIRM_LOOPS` consecutive polls and be confirmed by live BTC price movement (`BTC_STOP_CONFIRM_FRACTION`) before it's allowed to fire — a single 1-second spike in Kalshi's own order book will not, on its own, trigger an exit.
+- Shadow mode (even `--shadow-pessimistic`) fills on a book-crossing check,
+  not real queue position — live orders are passive limits that wait to be
+  hit, which is a different and generally worse mechanic. Treat shadow
+  results, pessimistic or not, as an upper bound on live performance, not
+  an estimate of it.
+- `place_order`'s live path reports the requested limit price as the fill
+  price, not the realized average fill, since the current client doesn't
+  surface it. True fills are at or better than that price on a crossing
+  order, so live PnL bookkeeping is if anything conservative here.
+- At 93–95c entries, breakeven requires a win rate in the mid-90s. A
+  moderate number of settled trades (dozens) is an operational smoke test,
+  not a statistically meaningful performance read — expect several hundred
+  trades before the win rate is trustworthy.
