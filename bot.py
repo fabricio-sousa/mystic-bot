@@ -1,9 +1,10 @@
 import os
 import json
+import math
 import time
 import uuid
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 import requests
 from kalshi_python_sync import Configuration, KalshiClient
@@ -28,13 +29,23 @@ except ImportError:
 _argp = argparse.ArgumentParser()
 _argp.add_argument("--shadow", action="store_true", help="Run in shadow mode: simulated fills, no real orders placed")
 _argp.add_argument("--shadow-cash", type=float, default=5000.0, help="Starting simulated cash for shadow mode (default: 5000)")
+_argp.add_argument("--shadow-pessimistic", action="store_true",
+                   help="Shadow mode: re-fetch the quote at order time and only fill if our limit price "
+                        "still crosses the book. Fills at the refreshed price, not the price the signal saw.")
 _args = _argp.parse_args()
 SHADOW_MODE = _args.shadow
+SHADOW_PESSIMISTIC = _args.shadow_pessimistic
 SHADOW_TAKER_FEE_MULTIPLIER = 0.07  # Kalshi's real published taker formula, verified against their fee schedule
+SHADOW_FEE_CEIL_TO_CENT = True      # Kalshi rounds the fee UP to the next whole cent per order. At 1-contract
+                                    # size the raw formula gives ~$0.003, so ignoring the rounding understates
+                                    # the real fee by ~3x. Set False to reproduce older backtest numbers.
 
 def shadow_taker_fee_dollars(price_cents, count):
     p = price_cents / 100.0
-    return count * SHADOW_TAKER_FEE_MULTIPLIER * p * (1 - p)
+    raw = count * SHADOW_TAKER_FEE_MULTIPLIER * p * (1 - p)
+    if SHADOW_FEE_CEIL_TO_CENT:
+        return math.ceil(raw * 100 - 1e-9) / 100.0
+    return raw
 
 # ====================== CONFIG ======================
 BOT_NAME = "Mystic-Bot 1.0 24/7" + (" [SHADOW]" if SHADOW_MODE else "")
@@ -58,13 +69,22 @@ ENTRY_THRESHOLD = 93          # minimum yes_bid/no_bid cents to consider (was ex
 RISK_PCT = 0.01               # flat risk per trade
 ORDER_POLL_SECONDS = 3        # how many 1s polls to wait for a fill before canceling the rest
 WICK_MIN_PCT = 0.00015        # min rejection-wick size as a % of BTC price (~$15 at $100k BTC)
-MAX_ENTRY_THRESHOLD = 97      # never take a fresh entry priced above this -- 98-99c entries are intentionally excluded
+MAX_ENTRY_THRESHOLD = 95      # never take a fresh entry priced above this -- 96-99c entries are intentionally excluded
+                               # (tightened from 97 after paper-run results showed the 93-95c band performing better)
 STOP_CONFIRM_LOOPS = 3        # consecutive loops (~1s each) the FULL stop condition must hold before it actually fires
 HIGH_ENTRY_STOP_THRESHOLD = 97            # entries at/above this price get a widened % stop (see below)
 HIGH_ENTRY_STOP_LOSS_PCT = 0.375          # 35-40% stop for high-probability (>=97c) entries, vs. the normal 20%
 HIGH_ENTRY_STOP_FLOOR_CENTS = 67          # the widened stop never triggers above this hard cents floor (~65-70c)
 HIGH_ENTRY_STOP_DISABLE_THRESHOLD = 96    # entries at/above this price...
 HIGH_ENTRY_STOP_DISABLE_TIME_LEFT_MIN = 1.75  # ...have the stop fully disabled once time_left drops below this
+# NOTE: with MAX_ENTRY_THRESHOLD=95, no entry can ever reach HIGH_ENTRY_STOP_THRESHOLD (97) or
+# HIGH_ENTRY_STOP_DISABLE_THRESHOLD (96) -- the four constants above are currently dormant, and
+# every position now uses the plain STOP_LOSS_THRESHOLD (20%) stop. Left in place rather than
+# deleted so re-raising MAX_ENTRY_THRESHOLD later restores the widened/disabled-stop behavior
+# without having to re-derive these values.
+MAX_DAILY_DRAWDOWN_PCT = 0.10  # if today's cash is down this fraction from today's opening cash,
+                                # pause new entries until midnight ET. Existing open positions are
+                                # still monitored and can still stop out or settle normally while paused.
 BTC_STOP_CONFIRM_FRACTION = 0.5           # live BTC must have reversed >= this fraction of its original entry-time
                                            # distance from window-open before a stop is allowed to fire
 OVERRIDE_TRIGGERED = False
@@ -134,6 +154,36 @@ def safe_price_cents(value) -> int:
     except Exception as e:
         log(f"⚠️ safe_price_cents parse error for value={value!r}: {e}")
         return 0
+
+# ====================== QUOTE HELPERS ======================
+# On Kalshi the yes and no books are the same book, so:
+#     yes_ask == 100 - no_bid        no_ask == 100 - yes_bid
+# We prefer the API's own ask field when it is present and non-zero, and fall
+# back to the complement otherwise. A 0 result means "no offer resting on that
+# side" -- callers must treat that as un-fillable, not as a price of zero.
+def _quote_cents(m, field, complement_field=None):
+    c = safe_price_cents(getattr(m, field, None))
+    if c <= 0 and complement_field is not None:
+        comp = safe_price_cents(getattr(m, complement_field, None))
+        c = (100 - comp) if comp > 0 else 0
+    return c
+
+def market_bids(m):
+    """(yes_bid, no_bid) in cents -- the price you SELL into."""
+    return _quote_cents(m, "yes_bid_dollars"), _quote_cents(m, "no_bid_dollars")
+
+def market_asks(m):
+    """(yes_ask, no_ask) in cents -- the price you BUY at."""
+    return (_quote_cents(m, "yes_ask_dollars", "no_bid_dollars"),
+            _quote_cents(m, "no_ask_dollars", "yes_bid_dollars"))
+
+def ask_for_side(m, side):
+    y, n = market_asks(m)
+    return y if side == "yes" else n
+
+def bid_for_side(m, side):
+    y, n = market_bids(m)
+    return y if side == "yes" else n
 
 def play_sound(event_type):
     if not HAS_WINDOWS:
@@ -290,17 +340,57 @@ def _to_book_order(side, action, price_cents):
     return book_side, book_price_cents
 
 def place_order(ticker, side, count, action, price_cents=None):
+    """Returns (filled_count, fill_price_cents).
+
+    fill_price_cents is what the caller must use for PnL -- in pessimistic
+    shadow mode it can differ from the requested price_cents.
+    """
+    limit_cents = (min(99, price_cents + MAX_SLIPPAGE) if action == "buy"
+                   else max(1, price_cents - MAX_SLIPPAGE))
+
     if SHADOW_MODE:
-        fee = shadow_taker_fee_dollars(price_cents, count)
+        fill_price = price_cents
+
+        if SHADOW_PESSIMISTIC:
+            # The signal's quote is already stale by the time we get here: the
+            # done-deal filters make a Binance klines call (up to 4s) between
+            # reading the book and ordering. Re-read the book and only fill if
+            # our limit still crosses it -- and fill at the NEW price.
+            try:
+                m = client.get_market(ticker).market
+            except Exception as e:
+                log(f"🌗 SHADOW[pess] NO FILL {action.upper()} {ticker}: quote re-fetch failed ({e})")
+                return 0, price_cents
+
+            if action == "buy":
+                fresh = ask_for_side(m, side)
+                if fresh <= 0 or fresh > limit_cents:
+                    log(f"🌗 SHADOW[pess] NO FILL buy {ticker} {side}: ask "
+                        f"{str(fresh) + 'c' if fresh > 0 else 'none resting'} > limit {limit_cents}c "
+                        f"(signal saw {price_cents}c)")
+                    return 0, price_cents
+            else:
+                fresh = bid_for_side(m, side)
+                if fresh <= 0 or fresh < limit_cents:
+                    log(f"🌗 SHADOW[pess] NO FILL sell {ticker} {side}: bid "
+                        f"{str(fresh) + 'c' if fresh > 0 else 'none resting'} < limit {limit_cents}c "
+                        f"(signal saw {price_cents}c)")
+                    return 0, price_cents
+
+            if fresh != price_cents:
+                log(f"🌗 SHADOW[pess] slippage on {action}: {price_cents}c -> {fresh}c")
+            fill_price = fresh
+
+        fee = shadow_taker_fee_dollars(fill_price, count)
         state = load_state()
         state["shadow_cash"] = state.get("shadow_cash", _args.shadow_cash) - fee
         save_state(state)
-        log(f"🌗 SHADOW {action.upper()} {count}x {ticker} @ {price_cents}c (fee ${fee:.4f}, simulated fill)")
-        return count
+        log(f"🌗 SHADOW {action.upper()} {count}x {ticker} @ {fill_price}c (fee ${fee:.4f}, simulated fill)")
+        return count, fill_price
 
     try:
         client_order_id = str(uuid.uuid4())
-        actual_price_cents = min(99, price_cents + MAX_SLIPPAGE) if action == "buy" else max(1, price_cents - MAX_SLIPPAGE)
+        actual_price_cents = limit_cents
         book_side, book_price_cents = _to_book_order(side, action, actual_price_cents)
 
         resp = client.create_order_v2(
@@ -317,12 +407,12 @@ def place_order(ticker, side, count, action, price_cents=None):
 
         for _ in range(ORDER_POLL_SECONDS):
             if filled >= count:
-                return filled
+                return filled, price_cents
             time.sleep(1)
             o = client.get_order(exchange_order_id).order
             filled = int(round(float(o.fill_count_fp)))
             if o.status == "executed":
-                return filled
+                return filled, price_cents
 
         if filled < count:
             try:
@@ -332,10 +422,14 @@ def place_order(ticker, side, count, action, price_cents=None):
             except Exception as ce:
                 log(f"⚠️ Cancel Error for order {exchange_order_id}: {ce}")
 
-        return filled
+        # NOTE: this reports the requested price, not the realised average fill
+        # price -- create_order_v2/get_order in this client don't surface it. On a
+        # crossing order the true fill is at or better than limit_cents, so live
+        # PnL is if anything slightly understated here.
+        return filled, price_cents
     except Exception as e:
         log(f"❌ Order Error: {e}")
-        return 0
+        return 0, price_cents
 
 POSITION_QTY_KEYS = ("position_fp", "position", "net_position", "quantity", "count")
 
@@ -405,7 +499,11 @@ def reconcile_state_with_positions(state):
 # ====================== MAIN LOOP ======================
 if __name__ == "__main__":
     log(f"🪄 {BOT_NAME} Active ({ENTRY_THRESHOLD}-{MAX_ENTRY_THRESHOLD}c Done-Deal Filters · 24/7 · loosened time/distance)")
+    if SHADOW_PESSIMISTIC and not SHADOW_MODE:
+        log("❌ --shadow-pessimistic requires --shadow. Refusing to start so this isn't mistaken for a dry run.")
+        raise SystemExit(2)
     if SHADOW_MODE:
+        log(f"🌗 FILL MODEL: {'PESSIMISTIC (re-quote at order time, no-fill if the book moves away)' if SHADOW_PESSIMISTIC else 'OPTIMISTIC (unconditional fill at the signal price)'}")
         log(f"🌗 SHADOW MODE: simulated fills only, no real orders. Starting cash: ${_args.shadow_cash:.2f}. "
             f"Writing to {os.path.basename(STATE_FILE)} / {os.path.basename(LOG_FILE)} / "
             f"{os.path.basename(TRADES_FILE)} (separate from a real instance's files).")
@@ -450,6 +548,41 @@ if __name__ == "__main__":
                 log(f"🚨 Shutdown: Cash ${cash:.2f} | Floor ${safety_floor:.2f} ({int(SAFETY_FLOOR_PCT*100)}% of peak ${peak_cash:.2f}) | Strikes {state.get('strikes')}")
                 break
 
+            # --- DAILY DRAWDOWN TRACKING ---
+            # Resets at ET calendar-day rollover, not a rolling 24h window, so "midnight" means
+            # the same thing here as it does to a human reading the log.
+            today_str = now_et.strftime("%Y-%m-%d")
+            if state.get("daily_date") != today_str:
+                state["daily_date"] = today_str
+                state["daily_start_cash"] = cash
+                state["daily_paused_until"] = None
+                save_state(state)
+                log(f"📅 New trading day ({today_str} ET): daily drawdown baseline set to ${cash:.2f}")
+
+            daily_start_cash = state.get("daily_start_cash", cash)
+            daily_dd_pct = (1 - cash / daily_start_cash) if daily_start_cash > 0 else 0.0
+
+            is_daily_paused = False
+            paused_until_str = state.get("daily_paused_until")
+            if paused_until_str:
+                paused_until = datetime.fromisoformat(paused_until_str)
+                if now_et < paused_until:
+                    is_daily_paused = True
+                else:
+                    state["daily_paused_until"] = None
+                    save_state(state)
+                    log("✅ Daily drawdown pause lifted.")
+
+            if not is_daily_paused and daily_dd_pct >= MAX_DAILY_DRAWDOWN_PCT - 1e-9:
+                midnight_next = (now_et + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+                state["daily_paused_until"] = midnight_next.isoformat()
+                save_state(state)
+                is_daily_paused = True
+                log(f"🛑 DAILY DRAWDOWN PAUSE: cash ${cash:.2f} is {daily_dd_pct*100:.1f}% below today's open "
+                    f"(${daily_start_cash:.2f}), limit is {int(MAX_DAILY_DRAWDOWN_PCT*100)}%. New entries paused "
+                    f"until {midnight_next.strftime('%Y-%m-%d %H:%M')} ET. Any open position is still monitored normally.")
+                play_sound("stop")
+
             # --- TICKER FETCH ---
             resp = client.get_markets(series_ticker="KXBTC15M", limit=5, status="open")
             markets = [m for m in getattr(resp, 'markets', []) if (m.close_time - now_et).total_seconds() > 0]
@@ -458,10 +591,11 @@ if __name__ == "__main__":
                 markets.sort(key=lambda x: x.close_time)
                 market = markets[0]
                 time_left = (market.close_time - now_et).total_seconds() / 60.0
-                y_p, n_p = safe_price_cents(market.yes_bid_dollars), safe_price_cents(market.no_bid_dollars)
+                y_bid, n_bid = market_bids(market)
+                y_ask, n_ask = market_asks(market)
             else:
                 time_left = 0
-                y_p = n_p = 0
+                y_bid = n_bid = y_ask = n_ask = 0
 
             # --- MONITORING / STOP LOSS ---
             if curr and curr.get("status") == "filled":
@@ -500,9 +634,9 @@ if __name__ == "__main__":
 
                 if curr.get('stop_breach_count', 0) >= STOP_CONFIRM_LOOPS:
                     log(f"🚨 STOP LOSS: Selling {curr['ticker']} (confirmed over {STOP_CONFIRM_LOOPS} consecutive polls)")
-                    filled = place_order(curr['ticker'], curr['side'], curr['count'], "sell", live_bid)
+                    filled, exit_price = place_order(curr['ticker'], curr['side'], curr['count'], "sell", live_bid)
                     if filled > 0:
-                        pnl = (live_bid - entry_p) * filled / 100.0
+                        pnl = (exit_price - entry_p) * filled / 100.0
                         update_trades_json({
                             "timestamp": now_et.strftime("%Y-%m-%d %H:%M:%S"),
                             "ticker": curr['ticker'],
@@ -530,7 +664,8 @@ if __name__ == "__main__":
 
             # --- HEARTBEAT / STATUS ---
             status_text = f" [IN: {curr['side'].upper()} @ {curr['entry_price_cents']}c]" if curr else ""
-            print(f"\r[{now_et.strftime('%H:%M:%S')}] Risk: {int(RISK_PCT*100)}% | Cash: ${cash:.2f} | Session: ${SESSION_PNL:+.2f}{status_text}", end="")
+            pause_text = " [DAILY DD PAUSE]" if is_daily_paused else ""
+            print(f"\r[{now_et.strftime('%H:%M:%S')}] Risk: {int(RISK_PCT*100)}% | Cash: ${cash:.2f} | Session: ${SESSION_PNL:+.2f} | Daily: {daily_dd_pct*100:+.1f}%{status_text}{pause_text}", end="")
 
             write_status({
                 "updated_at": now_et.isoformat(),
@@ -542,22 +677,29 @@ if __name__ == "__main__":
                 "risk_pct": round(RISK_PCT * 100, 1),
                 "entry_threshold": ENTRY_THRESHOLD,
                 "max_entry_threshold": MAX_ENTRY_THRESHOLD,
+                "daily_start_cash": round(daily_start_cash, 2),
+                "daily_drawdown_pct": round(daily_dd_pct * 100, 2),
+                "daily_drawdown_limit_pct": MAX_DAILY_DRAWDOWN_PCT * 100,
+                "is_daily_paused": is_daily_paused,
+                "daily_paused_until": state.get("daily_paused_until"),
                 "is_trading_window": is_trading_window,
                 "current_trade": curr,
                 "market": {
                     "ticker": market.ticker,
                     "time_left_min": round(time_left, 2),
-                    "yes_bid": y_p,
-                    "no_bid": n_p,
+                    "yes_bid": y_bid,
+                    "no_bid": n_bid,
+                    "yes_ask": y_ask,
+                    "no_ask": n_ask,
                     "watching_threshold": (
-                        (ENTRY_THRESHOLD <= y_p <= MAX_ENTRY_THRESHOLD)
-                        or (ENTRY_THRESHOLD <= n_p <= MAX_ENTRY_THRESHOLD)
+                        (ENTRY_THRESHOLD <= y_ask <= MAX_ENTRY_THRESHOLD)
+                        or (ENTRY_THRESHOLD <= n_ask <= MAX_ENTRY_THRESHOLD)
                     ),
                 } if markets else None,
                 "last_filter_check": LAST_FILTER_CHECK,
             })
 
-            if not is_trading_window and not curr:
+            if (not is_trading_window or is_daily_paused) and not curr:
                 time.sleep(10)
                 continue
             if not markets:
@@ -590,19 +732,22 @@ if __name__ == "__main__":
                 continue
 
             # --- ENTRY (≥ ENTRY_THRESHOLD + Done-Deal Filters) ---
-            elif not curr and is_trading_window:
+            elif not curr and is_trading_window and not is_daily_paused:
                 # Widened time band + accept any bid >= threshold (not exact equality),
                 # but never above MAX_ENTRY_THRESHOLD -- 98-99c entries are intentionally excluded.
-                y_qualifies = ENTRY_THRESHOLD <= y_p <= MAX_ENTRY_THRESHOLD
-                n_qualifies = ENTRY_THRESHOLD <= n_p <= MAX_ENTRY_THRESHOLD
+                # Priced off the ASK -- what we would actually pay -- not the bid.
+                # ENTRY_THRESHOLD/MAX_ENTRY_THRESHOLD now bound the real cost basis,
+                # so the same 93-97c band admits fewer signals than the bid version did.
+                y_qualifies = ENTRY_THRESHOLD <= y_ask <= MAX_ENTRY_THRESHOLD
+                n_qualifies = ENTRY_THRESHOLD <= n_ask <= MAX_ENTRY_THRESHOLD
                 if 1.75 <= time_left <= 4.5 and (y_qualifies or n_qualifies):
                     # Prefer the higher of the two sides if both qualify
                     if y_qualifies and n_qualifies:
-                        side, price = ("yes", y_p) if y_p >= n_p else ("no", n_p)
+                        side, price = ("yes", y_ask) if y_ask >= n_ask else ("no", n_ask)
                     elif y_qualifies:
-                        side, price = "yes", y_p
+                        side, price = "yes", y_ask
                     else:
-                        side, price = "no", n_p
+                        side, price = "no", n_ask
 
                     # === Done-deal filters ===
                     klines = get_btc_klines(limit=25)
@@ -642,7 +787,7 @@ if __name__ == "__main__":
                         qty = int(min(MAX_POSITION_DOLLARS, (cash * RISK_PCT)) * 100 // price)
                         if qty >= 1:
                             log(f"⚡ DONE-DEAL: {side.upper()} @ {price}c | dist={dist_pct:.3f}% | t={time_left:.1f}m (Qty: {qty})")
-                            filled = place_order(market.ticker, side, qty, "buy", price)
+                            filled, fill_price = place_order(market.ticker, side, qty, "buy", price)
                             if filled > 0:
                                 if filled < qty:
                                     log(f"⚠️ Partial fill on entry: {filled}/{qty} contracts.")
@@ -650,7 +795,7 @@ if __name__ == "__main__":
                                     "ticker": market.ticker,
                                     "side": side,
                                     "count": filled,
-                                    "entry_price_cents": price,
+                                    "entry_price_cents": fill_price,
                                     "status": "filled",
                                     "entry_btc_price": current_px,
                                     "entry_open_px": open_px,
