@@ -8,15 +8,29 @@ log.txt — from the same folder, and never touches the Kalshi API or your
 credentials. It's safe to run alongside the bot at all times.
 
 Setup:
-    pip install flask pytz
+    pip install flask pytz pyngrok
     Place this file in the same folder as bot.py (it reads state.json,
     trades.json, and log.txt from its own directory).
+
+    Optional -- to browse the dashboard from outside your machine via ngrok:
+      - Put your ngrok authtoken in a file called ngrok.txt, next to this
+        script (same convention as bot.py's apikey.txt / private.txt).
+      - Optional but recommended: put "username:password" in a file called
+        ngrok_auth.txt, next to this script, to put an HTTP Basic Auth
+        prompt in front of the tunnel. This dashboard shows your cash
+        balance, open position, and full trade history with no login of
+        its own -- an ngrok URL without ngrok_auth.txt is reachable by
+        anyone who has the link, not just you.
+      - If ngrok.txt is missing, empty, or the tunnel fails to start for
+        any reason, the dashboard falls back to local-only
+        (http://localhost:5000) rather than failing to start.
 
 Run:
     python dashboard.py
 
-Then open http://localhost:5000 in a browser. The page polls for updates
-automatically — no need to refresh.
+Then open http://localhost:5000 in a browser (and the printed ngrok URL,
+if a tunnel started). The page polls for updates automatically -- no need
+to refresh.
 """
 
 import os
@@ -25,6 +39,12 @@ from datetime import datetime
 
 import pytz
 from flask import Flask, jsonify
+
+try:
+    from pyngrok import ngrok as _ngrok
+    HAS_PYNGROK = True
+except ImportError:
+    HAS_PYNGROK = False
 
 # ====================== CONFIG ======================
 BOT_NAME = "Mystic-Bot 1.0"
@@ -35,14 +55,74 @@ TRADES_FILE = os.path.join(BASE_DIR, "trades.json")
 LOG_FILE = os.path.join(BASE_DIR, "log.txt")
 HEARTBEAT_FILE = os.path.join(BASE_DIR, "heartbeat.txt")
 STATUS_FILE = os.path.join(BASE_DIR, "status.json")
+NGROK_TOKEN_FILE = os.path.join(BASE_DIR, "ngrok.txt")       # never logged, never committed -- treat like apikey.txt
+NGROK_AUTH_FILE = os.path.join(BASE_DIR, "ngrok_auth.txt")   # optional "username:password" for the tunnel's Basic Auth
 
 STRIKE_LIMIT = 3
 LOG_TAIL_LINES = 80
 RECENT_TRADES_LIMIT = 30
 STALE_AFTER_SECONDS = 60   # heartbeat file untouched longer than this => bot considered offline
+PORT = 5000
 ET = pytz.timezone("US/Eastern")
 
 app = Flask(__name__)
+
+# ====================== NGROK TUNNEL (optional) ======================
+def start_ngrok_tunnel(port):
+    """Best-effort: any failure here falls back to local-only and prints why,
+    it never raises -- a bad ngrok.txt shouldn't take down the dashboard."""
+    if not HAS_PYNGROK:
+        print("ℹ️  pyngrok not installed (`pip install pyngrok`) -- dashboard is local-only "
+              f"at http://localhost:{port}.")
+        return None
+
+    if not os.path.exists(NGROK_TOKEN_FILE):
+        print(f"ℹ️  {os.path.basename(NGROK_TOKEN_FILE)} not found -- dashboard is local-only "
+              f"at http://localhost:{port}. To browse it online, put your ngrok authtoken in "
+              f"{os.path.basename(NGROK_TOKEN_FILE)} next to this script.")
+        return None
+
+    try:
+        with open(NGROK_TOKEN_FILE, "r", encoding="utf-8") as f:
+            token = f.read().strip()
+    except Exception as e:
+        print(f"⚠️  Couldn't read {os.path.basename(NGROK_TOKEN_FILE)} ({e}) -- dashboard is local-only.")
+        return None
+
+    if not token:
+        print(f"⚠️  {os.path.basename(NGROK_TOKEN_FILE)} is empty -- dashboard is local-only.")
+        return None
+
+    basic_auth = None
+    if os.path.exists(NGROK_AUTH_FILE):
+        try:
+            with open(NGROK_AUTH_FILE, "r", encoding="utf-8") as f:
+                candidate = f.read().strip()
+            if ":" in candidate:
+                basic_auth = candidate
+            else:
+                print(f"⚠️  {os.path.basename(NGROK_AUTH_FILE)} exists but isn't in "
+                      f"\"username:password\" format -- starting the tunnel WITHOUT Basic Auth.")
+        except Exception as e:
+            print(f"⚠️  Couldn't read {os.path.basename(NGROK_AUTH_FILE)} ({e}) -- "
+                  f"starting the tunnel WITHOUT Basic Auth.")
+
+    try:
+        _ngrok.set_auth_token(token)
+        connect_kwargs = {"auth": basic_auth} if basic_auth else {}
+        tunnel = _ngrok.connect(port, "http", **connect_kwargs)
+        print(f"🌐 ngrok tunnel live: {tunnel.public_url}  (forwards to http://localhost:{port})")
+        if basic_auth:
+            print("   Basic Auth is enabled on the tunnel.")
+        else:
+            print("   ⚠️  No Basic Auth set -- this URL shows cash balance, open position, and "
+                  f"trade history to anyone who has it. Add {os.path.basename(NGROK_AUTH_FILE)} "
+                  "(\"username:password\") to require a login.")
+        return tunnel
+    except Exception as e:
+        print(f"⚠️  ngrok tunnel failed to start ({e}) -- dashboard is local-only at "
+              f"http://localhost:{port}.")
+        return None
 
 # ====================== DATA HELPERS ======================
 def read_json_safe(path, default):
@@ -221,64 +301,6 @@ INDEX_HTML = """<!DOCTYPE html>
   }
 
   .server-time { color: var(--text-faint); }
-
-  /* ---------- Ticker tape ---------- */
-  .ticker-wrap {
-    border-bottom: 1px solid var(--hairline);
-    background: var(--panel);
-    overflow: hidden;
-    white-space: nowrap;
-    position: relative;
-  }
-
-  .ticker-wrap::before, .ticker-wrap::after {
-    content: "";
-    position: absolute;
-    top: 0; bottom: 0;
-    width: 40px;
-    z-index: 2;
-    pointer-events: none;
-  }
-  .ticker-wrap::before { left: 0; background: linear-gradient(90deg, var(--panel), transparent); }
-  .ticker-wrap::after  { right: 0; background: linear-gradient(270deg, var(--panel), transparent); }
-
-  .ticker-track {
-    display: inline-flex;
-    align-items: center;
-    padding: 9px 0;
-    animation: scroll-left 40s linear infinite;
-  }
-
-  .ticker-track:hover { animation-play-state: paused; }
-
-  .ticker-track.static {
-    animation: none;
-    width: 100%;
-    justify-content: center;
-  }
-
-  @keyframes scroll-left {
-    from { transform: translateX(0); }
-    to   { transform: translateX(-50%); }
-  }
-
-  .ticker-item {
-    display: inline-flex;
-    align-items: baseline;
-    gap: 7px;
-    font-family: var(--mono);
-    font-size: 12px;
-    padding: 0 22px;
-    border-right: 1px solid var(--hairline);
-    color: var(--text-dim);
-  }
-
-  .ticker-item .side { font-weight: 700; letter-spacing: 0.04em; }
-  .ticker-item .side.yes { color: var(--positive); }
-  .ticker-item .side.no { color: var(--negative); }
-  .ticker-item .pnl.positive { color: var(--positive); }
-  .ticker-item .pnl.negative { color: var(--negative); }
-  .ticker-empty { font-family: var(--mono); font-size: 12px; color: var(--text-faint); padding: 9px 22px; }
 
   /* ---------- Layout ---------- */
   main {
@@ -505,7 +527,6 @@ INDEX_HTML = """<!DOCTYPE html>
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .ticker-track { animation: none; overflow-x: auto; }
     .dot.online { animation: none; }
   }
 </style>
@@ -521,12 +542,6 @@ INDEX_HTML = """<!DOCTYPE html>
     <span id="server-time" class="server-time">--:--:--</span>
   </div>
 </header>
-
-<div class="ticker-wrap">
-  <div id="ticker-track" class="ticker-track static">
-    <span class="ticker-empty">Waiting for trade history&hellip;</span>
-  </div>
-</div>
 
 <main>
 
@@ -683,27 +698,6 @@ INDEX_HTML = """<!DOCTYPE html>
     `;
   }
 
-  function renderTicker(trades) {
-    const track = document.getElementById("ticker-track");
-    if (!trades || trades.length === 0) {
-      track.className = "ticker-track static";
-      track.innerHTML = '<span class="ticker-empty">Waiting for trade history&hellip;</span>';
-      return;
-    }
-    track.className = "ticker-track";
-    const items = trades.slice(0, 15).map(t => {
-      const side = (t.side || "").toLowerCase();
-      const pnl = t.pnl ?? 0;
-      return `<span class="ticker-item">
-        <span>${t.ticker || ""}</span>
-        <span class="side ${side}">${side.toUpperCase()}</span>
-        <span class="pnl ${pnlClass(pnl)}">${fmtMoney(pnl)}</span>
-      </span>`;
-    }).join("");
-    // duplicate the sequence so the CSS loop (translateX -50%) is seamless
-    track.innerHTML = items + items;
-  }
-
   function renderLog(lines) {
     const el = document.getElementById("log-body");
     const wasNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
@@ -765,7 +759,7 @@ INDEX_HTML = """<!DOCTYPE html>
           </div>
           <div>
             <div class="field-label">Watching ${entryThreshold}&cent;</div>
-            <div class="field-value">${m.watching_97c ? '<span class="badge yes">YES</span>' : '<span class="dim">no</span>'}</div>
+            <div class="field-value">${m.watching_threshold ? '<span class="badge yes">YES</span>' : '<span class="dim">no</span>'}</div>
           </div>
         </div>`;
     } else {
@@ -813,7 +807,6 @@ INDEX_HTML = """<!DOCTYPE html>
 
       renderPosition(data.current_trade);
       renderTrades(data.recent_trades);
-      renderTicker(data.recent_trades);
       renderLog(data.log_tail);
       renderScanner(data.scanner);
     } catch (e) {
@@ -833,4 +826,5 @@ INDEX_HTML = """<!DOCTYPE html>
 """
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    start_ngrok_tunnel(PORT)
+    app.run(host="0.0.0.0", port=PORT, debug=False)
