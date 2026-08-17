@@ -87,6 +87,13 @@ MAX_DAILY_DRAWDOWN_PCT = 0.10  # if today's cash is down this fraction from toda
                                 # still monitored and can still stop out or settle normally while paused.
 BTC_STOP_CONFIRM_FRACTION = 0.5           # live BTC must have reversed >= this fraction of its original entry-time
                                            # distance from window-open before a stop is allowed to fire
+SKIP_LOG_THROTTLE_SECONDS = 30   # suppress repeat "Skip" log lines for the identical ticker/side/price/reason
+                                  # within this window -- logs immediately again the moment any of those change
+HEARTBEAT_PRINT_INTERVAL_SECONDS = 10   # console "Risk: ..." status line refresh rate. heartbeat.txt (the
+                                         # dashboard's liveness file) still updates every loop regardless --
+                                         # this only throttles the human-readable console/stdout line, which
+                                         # floods any output that doesn't collapse \r (redirected to a file,
+                                         # piped through a log viewer, run under a supervisor, etc.)
 OVERRIDE_TRIGGERED = False
 SESSION_PNL = 0.00
 LAST_FILTER_CHECK = None      # most recent done-deal filter evaluation, for status.json
@@ -512,6 +519,9 @@ if __name__ == "__main__":
     if not SHADOW_MODE:
         state = reconcile_state_with_positions(state)
 
+    _last_skip_log = {"key": None, "ts": 0.0}
+    _last_heartbeat_print_ts = 0.0
+
     while True:
         try:
             write_heartbeat()
@@ -665,7 +675,10 @@ if __name__ == "__main__":
             # --- HEARTBEAT / STATUS ---
             status_text = f" [IN: {curr['side'].upper()} @ {curr['entry_price_cents']}c]" if curr else ""
             pause_text = " [DAILY DD PAUSE]" if is_daily_paused else ""
-            print(f"\r[{now_et.strftime('%H:%M:%S')}] Risk: {int(RISK_PCT*100)}% | Cash: ${cash:.2f} | Session: ${SESSION_PNL:+.2f} | Daily: {daily_dd_pct*100:+.1f}%{status_text}{pause_text}", end="")
+            _now_wall = time.time()
+            if _now_wall - _last_heartbeat_print_ts >= HEARTBEAT_PRINT_INTERVAL_SECONDS:
+                print(f"\r[{now_et.strftime('%H:%M:%S')}] Risk: {int(RISK_PCT*100)}% | Cash: ${cash:.2f} | Session: ${SESSION_PNL:+.2f} | Daily: {daily_dd_pct*100:+.1f}%{status_text}{pause_text}", end="")
+                _last_heartbeat_print_ts = _now_wall
 
             write_status({
                 "updated_at": now_et.isoformat(),
@@ -816,7 +829,12 @@ if __name__ == "__main__":
                             LAST_FILTER_CHECK["filters_ok"] = False
                             LAST_FILTER_CHECK["reason"] = skip_reason
                     else:
-                        log(f"⏭ Skip ≥{ENTRY_THRESHOLD}c {side.upper()} @ {price}c: {reason}")
+                        _skip_key = f"{market.ticker}|{side}|{price}|{reason}"
+                        _now = time.time()
+                        if _skip_key != _last_skip_log["key"] or (_now - _last_skip_log["ts"]) >= SKIP_LOG_THROTTLE_SECONDS:
+                            log(f"⏭ Skip ≥{ENTRY_THRESHOLD}c {side.upper()} @ {price}c: {reason}")
+                            _last_skip_log["key"] = _skip_key
+                            _last_skip_log["ts"] = _now
 
             time.sleep(1)
         except Exception as e:
