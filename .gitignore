@@ -8,3 +8,4 @@ shadow_heartbeat.txt
 shadow_log.txt
 shadow_state.json
 shadow_status.json
+shadow_trades.json
