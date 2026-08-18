@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 import pytz
 import requests
 from kalshi_python_sync import Configuration, KalshiClient
+from kalshi_python_sync.models import CreateOrderV2Request
 
 # Windows-only tools
 try:
@@ -62,7 +63,7 @@ STATUS_FILE = os.path.join(BASE_DIR, f"{_prefix}status.json")
 
 MAX_SLIPPAGE = 1
 MAX_POSITION_DOLLARS = 500.0
-SAFETY_FLOOR_PCT = 0.75       # bot halts if cash drops to this fraction of the highest balance ever reached (trailing, not a fixed dollar amount)
+SAFETY_FLOOR_PCT = 0.75       # bothalts if cash drops to this fraction of the highest balance ever reached (trailing, not a fixed dollar amount)
 STRIKE_LIMIT = 3
 STOP_LOSS_THRESHOLD = 0.20
 ENTRY_THRESHOLD = 93          # minimum yes_bid/no_bid cents to consider (was exact == 93)
@@ -330,7 +331,9 @@ with open(APIKEY_FILE, "r", encoding="utf-8") as f:
 with open(PRIVATE_FILE, "r", encoding="utf-8") as f:
     private_key_pem = f.read()
 
-config = Configuration(host="https://api.elections.kalshi.com/trade-api/v2")
+# Recommended host for Trade API writes (Create Order V2 lives under /portfolio/events/orders).
+# api.elections.kalshi.com is still supported for reads, but external-api is the canonical write host.
+config = Configuration(host="https://external-api.kalshi.com/trade-api/v2")
 config.api_key_id = api_key_id
 config.private_key_pem = private_key_pem
 client = KalshiClient(config)
@@ -400,15 +403,19 @@ def place_order(ticker, side, count, action, price_cents=None):
         actual_price_cents = limit_cents
         book_side, book_price_cents = _to_book_order(side, action, actual_price_cents)
 
-        resp = client.create_order_v2(
+        # V2 create: single-book bid/ask + fixed-point dollar price.
+        # Must pass a CreateOrderV2Request body (not flat kwargs).
+        req = CreateOrderV2Request(
             ticker=ticker,
             client_order_id=client_order_id,
             side=book_side,
             count=f"{count:.2f}",
-            price=f"{book_price_cents / 100:.2f}",
+            price=f"{book_price_cents / 100:.4f}",
             time_in_force="good_till_canceled",
             self_trade_prevention_type=SELF_TRADE_PREVENTION_TYPE,
         )
+        resp = client.create_order_v2(create_order_v2_request=req)
+
         exchange_order_id = resp.order_id
         filled = int(round(float(resp.fill_count)))
 
@@ -418,20 +425,20 @@ def place_order(ticker, side, count, action, price_cents=None):
             time.sleep(1)
             o = client.get_order(exchange_order_id).order
             filled = int(round(float(o.fill_count_fp)))
-            if o.status == "executed":
+            if getattr(o, "status", "") == "executed":
                 return filled, price_cents
 
         if filled < count:
             try:
-                client.cancel_order_v2(exchange_order_id)
+                client.cancel_order_v2(order_id=exchange_order_id)
                 o = client.get_order(exchange_order_id).order
                 filled = int(round(float(o.fill_count_fp)))
             except Exception as ce:
                 log(f"⚠️ Cancel Error for order {exchange_order_id}: {ce}")
 
         # NOTE: this reports the requested price, not the realised average fill
-        # price -- create_order_v2/get_order in this client don't surface it. On a
-        # crossing order the true fill is at or better than limit_cents, so live
+        # price -- create_order_v2/get_order in this client don't always surface it.
+        # On a crossing order the true fill is at or better than limit_cents, so live
         # PnL is if anything slightly understated here.
         return filled, price_cents
     except Exception as e:
