@@ -440,22 +440,41 @@ def place_order(ticker, side, count, action, price_cents=None):
                 log(f"⚠️ Couldn't parse average_fill_price={resp.average_fill_price!r}; "
                     f"falling back to requested {price_cents}c for PnL.")
 
-        for _ in range(ORDER_POLL_SECONDS):
-            if filled >= count:
-                return filled, fill_price_cents
-            time.sleep(1)
-            o = client.get_order(exchange_order_id).order
-            filled = int(round(float(o.fill_count_fp)))
-            if o.status == "executed":
-                return filled, fill_price_cents
+        if filled >= count:
+            return filled, fill_price_cents
 
-        if filled < count:
-            try:
-                client.cancel_order_v2(order_id=exchange_order_id)
-                o = client.get_order(exchange_order_id).order
-                filled = int(round(float(o.fill_count_fp)))
-            except Exception as ce:
-                log(f"⚠️ Cancel Error for order {exchange_order_id}: {ce}")
+        # --- Partial or no immediate fill: the remainder is resting (GTC) ---
+        # We deliberately do NOT poll with get_order here. get_order serialises to the
+        # legacy path /portfolio/orders/{order_id}, which external-api.kalshi.com does not
+        # route -- it 404s (verified live). The old poll loop let that 404 escape to the
+        # outer handler, which returned filled=0 while the order was still live on the
+        # exchange: the bot would log "Entry failed" and move on while actually holding an
+        # unmanaged position with no stop-loss and no settlement tracking.
+        #
+        # Instead: give the resting remainder a moment, then cancel it. CancelOrderV2Response
+        # returns reduced_by = the number of contracts pulled off the book, so anything that
+        # filled in the meantime is exactly count - reduced_by. Uses only V2 paths.
+        time.sleep(ORDER_POLL_SECONDS)
+        try:
+            cancel_resp = client.cancel_order_v2(order_id=exchange_order_id)
+            reduced = int(round(float(cancel_resp.reduced_by)))
+            filled = max(0, count - reduced)
+            if filled > 0:
+                log(f"ℹ️ Order {exchange_order_id}: {filled}/{count} filled while resting "
+                    f"({reduced} cancelled).")
+        except Exception as ce:
+            # Cancel failed -- most likely the order fully executed before we got here, but
+            # we must not guess. Ask the exchange what we actually own.
+            log(f"⚠️ Cancel failed for {exchange_order_id} ({ce}) -- verifying via positions.")
+            verified = _filled_qty_from_positions(ticker)
+            if verified is None:
+                log(f"🚨 UNVERIFIED ORDER {exchange_order_id} on {ticker}: could not cancel and "
+                    f"could not read positions. Assuming FULLY FILLED ({count}) so the position "
+                    f"is tracked and stop-loss/settlement still run. CHECK KALSHI MANUALLY.")
+                filled = count
+            else:
+                filled = min(count, verified)
+                log(f"ℹ️ Positions report {verified} contract(s) on {ticker}; booking {filled}.")
 
         return filled, fill_price_cents
     except Exception as e:
@@ -477,6 +496,27 @@ def _extract_position_qty(p):
             except (TypeError, ValueError):
                 continue
     return None, raw
+
+def _filled_qty_from_positions(ticker):
+    """Absolute contract count currently held on `ticker` per the exchange.
+
+    Returns None if positions can't be read or the schema isn't understood, so
+    callers can distinguish "confirmed flat" (0) from "don't know" (None).
+    Uses /portfolio/positions, which is routed on the external-api host.
+    """
+    try:
+        positions_resp = client.get_positions()
+        for p in positions_resp.market_positions:
+            qty, raw_fields = _extract_position_qty(p)
+            if qty is None:
+                continue
+            p_ticker = getattr(p, "ticker", raw_fields.get("ticker"))
+            if p_ticker == ticker:
+                return abs(qty)
+        return 0
+    except Exception as e:
+        log(f"⚠️ Could not read positions to verify fill on {ticker}: {e}")
+        return None
 
 def reconcile_state_with_positions(state):
     try:
