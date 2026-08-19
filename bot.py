@@ -77,7 +77,7 @@ WICK_MIN_PCT = 0.00015        # min rejection-wick size as a % of BTC price (~$1
 MAX_ENTRY_THRESHOLD = 95      # never take a fresh entry priced above this -- 96-99c entries are intentionally excluded
                                # (tightened from 97 after paper-run results showed the 93-95c band performing better)
 ENTRY_TIME_LEFT_MIN = 1.75     # earliest entry: minutes remaining in the 15m window
-ENTRY_TIME_LEFT_MAX = 5.0      # latest entry upper bound (was 4.5 -- see note below)
+ENTRY_TIME_LEFT_MAX = 4.5      # latest entry upper bound (was 4.5 -- see note below)
 # NOTE on the 4.5 -> 5.0 change: this came from an in-sample window search over the same
 # 3-month backtest period (candidates included 1.0-6.0, 1.5-5.0, 1.75-5.0, 2.0-5.0), and the
 # backtest report's own numbers don't fully reconcile -- one table reports 509 trades for the
