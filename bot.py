@@ -101,6 +101,11 @@ MAX_DAILY_DRAWDOWN_PCT = 0.10  # if today's cash is down this fraction from toda
                                 # still monitored and can still stop out or settle normally while paused.
 BTC_STOP_CONFIRM_FRACTION = 0.5           # live BTC must have reversed >= this fraction of its original entry-time
                                            # distance from window-open before a stop is allowed to fire
+STOP_RETRY_BACKOFF_SECONDS = 5   # wait between failed stop-loss re-submissions. A stop fires when the
+                                  # book is moving away, so the bid is often thin or absent; retrying every
+                                  # loop just churns orders against nothing.
+STOP_RETRY_WARN_AFTER = 5        # after this many failed exits, warn loudly that the position is likely
+                                  # riding to settlement for a full loss rather than a stopped one
 SKIP_LOG_THROTTLE_SECONDS = 30   # suppress repeat "Skip" log lines for the identical ticker/side/price/reason
                                   # within this window -- logs immediately again the moment any of those change
 HEARTBEAT_PRINT_INTERVAL_SECONDS = 10   # console "Risk: ..." status line refresh rate. heartbeat.txt (the
@@ -485,9 +490,19 @@ def place_order(ticker, side, count, action, price_cents=None):
                     f"could not read positions. Assuming FULLY FILLED ({count}) so the position "
                     f"is tracked and stop-loss/settlement still run. CHECK KALSHI MANUALLY.")
                 filled = count
-            else:
+            elif action == "buy":
+                # Entering from flat: the position we now hold IS what filled.
                 filled = min(count, verified)
                 log(f"ℹ️ Positions report {verified} contract(s) on {ticker}; booking {filled}.")
+            else:
+                # Exiting: positions reports what REMAINS, not what sold. We came in holding
+                # `count`, so the fill is count - remaining. Reading `verified` directly here
+                # would invert the result -- a fully-filled exit (remaining 0) would look like
+                # a zero fill, and the caller would keep re-selling contracts it no longer
+                # owns, flipping the position short.
+                filled = max(0, count - verified)
+                log(f"ℹ️ Positions report {verified} contract(s) still on {ticker}; "
+                    f"booking {filled} of {count} sold.")
 
         return filled, fill_price_cents
     except Exception as e:
@@ -716,6 +731,7 @@ if __name__ == "__main__":
                     save_state(state)
                 elif curr.get('stop_breach_count', 0):
                     curr['stop_breach_count'] = 0
+                    curr['stop_retry_count'] = 0   # price recovered; a later stop starts fresh
                     state['current_trade'] = curr
                     save_state(state)
 
@@ -754,7 +770,23 @@ if __name__ == "__main__":
                         play_sound("stop")
                         continue
                     else:
-                        log(f"⚠️ Stop-loss order for {curr['ticker']} did not fill. Will reassess next loop.")
+                        curr['stop_retry_count'] = curr.get('stop_retry_count', 0) + 1
+                        n = curr['stop_retry_count']
+                        # Back off instead of re-submitting every loop. A stop fires exactly
+                        # when the book is running away, so the bid is often thin or gone --
+                        # hammering it every ~5s just churns orders against an empty book.
+                        # Log the first few attempts, then only every 10th, to avoid the same
+                        # log spam we throttled elsewhere.
+                        if n <= 3 or n % 10 == 0:
+                            log(f"⚠️ Stop-loss order for {curr['ticker']} did not fill "
+                                f"(attempt {n}). Will reassess next loop.")
+                        if n == STOP_RETRY_WARN_AFTER:
+                            log(f"🚨 Stop-loss on {curr['ticker']} has failed {n} times -- the "
+                                f"bid is likely gone. This position may ride to settlement for "
+                                f"a FULL loss rather than a stopped one.")
+                        state["current_trade"] = curr
+                        save_state(state)
+                        time.sleep(STOP_RETRY_BACKOFF_SECONDS)
 
             # --- HEARTBEAT / STATUS ---
             status_text = f" [IN: {curr['side'].upper()} @ {curr['entry_price_cents']}c]" if curr else ""
