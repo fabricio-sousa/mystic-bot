@@ -431,11 +431,19 @@ def place_order(ticker, side, count, action, price_cents=None):
         # CreateOrderV2Response carries the realised average fill price as a fixed-point
         # dollar string. Prefer it over the requested limit -- on a crossing order the true
         # fill is at or better than our limit, so using the limit understated live PnL.
-        # It's Optional and only meaningful when something actually filled.
+        #
+        # CRITICAL: average_fill_price is quoted in BOOK terms -- Kalshi runs a single
+        # YES-denominated book. _to_book_order() converts a NO price p to (100 - p) on the
+        # way out, so the fill comes back inverted for NO trades and MUST be converted back
+        # here. Storing the raw book price as entry_price_cents recorded a 94c NO entry as
+        # 6c, which both inflated settlement PnL ((100-6)=94c "profit" instead of 6c) and
+        # silently disabled the stop-loss (stop_p = 6*0.8 = 4.8c, which the ~94c NO bid can
+        # never breach). YES trades are unaffected since book price == yes price.
         fill_price_cents = price_cents
         if filled > 0 and getattr(resp, "average_fill_price", None):
             try:
-                fill_price_cents = int(round(float(resp.average_fill_price) * 100))
+                book_fill_cents = int(round(float(resp.average_fill_price) * 100))
+                fill_price_cents = book_fill_cents if side == "yes" else 100 - book_fill_cents
             except (TypeError, ValueError):
                 log(f"⚠️ Couldn't parse average_fill_price={resp.average_fill_price!r}; "
                     f"falling back to requested {price_cents}c for PnL.")
