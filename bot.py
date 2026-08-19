@@ -40,12 +40,17 @@ SHADOW_FEE_CEIL_TO_CENT = True      # Kalshi rounds the fee UP to the next whole
                                     # size the raw formula gives ~$0.003, so ignoring the rounding understates
                                     # the real fee by ~3x. Set False to reproduce older backtest numbers.
 
-def shadow_taker_fee_dollars(price_cents, count):
+def taker_fee_dollars(price_cents, count):
+    """Kalshi's published taker fee: 0.07 * p * (1-p) per contract, rounded UP to
+    the next whole cent per order. Used by shadow fills AND by live PnL."""
     p = price_cents / 100.0
     raw = count * SHADOW_TAKER_FEE_MULTIPLIER * p * (1 - p)
     if SHADOW_FEE_CEIL_TO_CENT:
         return math.ceil(raw * 100 - 1e-9) / 100.0
     return raw
+
+# Back-compat alias -- older call sites / any external tooling.
+shadow_taker_fee_dollars = taker_fee_dollars
 
 # ====================== CONFIG ======================
 BOT_NAME = "Mystic-Bot 1.0 24/7" + (" [SHADOW]" if SHADOW_MODE else "")
@@ -718,7 +723,14 @@ if __name__ == "__main__":
                     log(f"🚨 STOP LOSS: Selling {curr['ticker']} (confirmed over {STOP_CONFIRM_LOOPS} consecutive polls)")
                     filled, exit_price = place_order(curr['ticker'], curr['side'], curr['count'], "sell", live_bid)
                     if filled > 0:
-                        pnl = (exit_price - entry_p) * filled / 100.0
+                        # A stop pays the taker fee TWICE -- once entering, once exiting.
+                        # Shadow already charged both at fill time, so live only.
+                        if SHADOW_MODE:
+                            fees = 0.0
+                        else:
+                            fees = (taker_fee_dollars(entry_p, filled)
+                                    + taker_fee_dollars(exit_price, filled))
+                        pnl = (exit_price - entry_p) * filled / 100.0 - fees
                         update_trades_json({
                             "timestamp": now_et.strftime("%Y-%m-%d %H:%M:%S"),
                             "ticker": curr['ticker'],
@@ -798,7 +810,16 @@ if __name__ == "__main__":
                 res = getattr(client.get_market(curr['ticker']).market, 'result', '').lower()
                 if res in ['yes', 'no']:
                     won = (curr['side'] == res)
-                    pnl = (100 - curr['entry_price_cents']) * curr['count'] / 100.0 if won else -(curr['entry_price_cents'] * curr['count'] / 100.0)
+                    gross = ((100 - curr['entry_price_cents']) * curr['count'] / 100.0 if won
+                             else -(curr['entry_price_cents'] * curr['count'] / 100.0))
+                    # Kalshi charges a taker fee on the ENTRY fill; settlement itself is
+                    # free. In shadow mode that fee was already deducted from shadow_cash
+                    # at fill time, so netting it here too would double-count -- live only.
+                    # It matters most at small size: the fee rounds UP to a whole cent per
+                    # order, so a 1-contract 94c win is +$0.06 gross but +$0.05 net.
+                    entry_fee = 0.0 if SHADOW_MODE else taker_fee_dollars(
+                        curr['entry_price_cents'], curr['count'])
+                    pnl = gross - entry_fee
                     update_trades_json({
                         "timestamp": now_et.strftime("%Y-%m-%d %H:%M:%S"),
                         "ticker": curr['ticker'],
