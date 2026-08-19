@@ -14,3 +14,4 @@ trades.json
 shadowdashboard.py
 shadowdashboard.py
 test_order_path.py
+__pycache__/bot.cpython-314.pyc
