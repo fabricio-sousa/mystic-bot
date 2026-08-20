@@ -32,7 +32,14 @@ _argp.add_argument("--shadow-cash", type=float, default=5000.0, help="Starting s
 _argp.add_argument("--shadow-pessimistic", action="store_true",
                    help="Shadow mode: re-fetch the quote at order time and only fill if our limit price "
                         "still crosses the book. Fills at the refreshed price, not the price the signal saw.")
+_argp.add_argument("--alert-only", action="store_true",
+                   help="Signal-only mode: run every filter exactly as normal, alert loudly when a "
+                        "setup qualifies, but NEVER place an order. You execute manually.")
+_argp.add_argument("--no-sound", action="store_true",
+                   help="Alert-only mode: suppress the audible beep (visual alert only)")
 _args = _argp.parse_args()
+ALERT_ONLY = _args.alert_only
+ALERT_SOUND = not _args.no_sound
 SHADOW_MODE = _args.shadow
 SHADOW_PESSIMISTIC = _args.shadow_pessimistic
 SHADOW_TAKER_FEE_MULTIPLIER = 0.07  # Kalshi's real published taker formula, verified against their fee schedule
@@ -66,6 +73,20 @@ HEARTBEAT_FILE = os.path.join(BASE_DIR, f"{_prefix}heartbeat.txt")
 STATUS_FILE = os.path.join(BASE_DIR, f"{_prefix}status.json")
 
 MAX_SLIPPAGE = 1
+# --- Fill aggression -----------------------------------------------------------------
+# Live results with the old ask+1c tolerance: ~1 entry fill in 8 signals, and a stop that
+# either never filled (empty overnight book) or slipped to 57c against a 75c trigger.
+# Because a marketable limit fills at the BEST RESTING PRICE rather than at the limit,
+# raising these does not worsen normal fills -- it only stops us missing them.
+AGGRESSIVE_ENTRY = True    # bid up to MAX_ENTRY_THRESHOLD instead of ask+MAX_SLIPPAGE.
+                            # Cannot overpay: MAX_ENTRY_THRESHOLD is already the top of the
+                            # band we accept, and price improvement still fills us at the
+                            # best ask (a 93c ask fills at 93c even with a 95c limit).
+AGGRESSIVE_EXIT = True     # price exits well through the bid so they actually cross.
+EXIT_SLIPPAGE_CENTS = 15   # how far below the bid to place an exit. Wide on purpose: the
+                            # bid is thin exactly when a stop fires, and price improvement
+                            # means we still receive the best available bid, not this price.
+                            # It is a floor on what we will accept, not what we expect.
 MAX_POSITION_DOLLARS = 500.0
 SAFETY_FLOOR_PCT = 0.75       # bot halts if cash drops to this fraction of the highest balance ever reached (trailing, not a fixed dollar amount)
 STRIKE_LIMIT = 3
@@ -77,7 +98,7 @@ WICK_MIN_PCT = 0.00015        # min rejection-wick size as a % of BTC price (~$1
 MAX_ENTRY_THRESHOLD = 95      # never take a fresh entry priced above this -- 96-99c entries are intentionally excluded
                                # (tightened from 97 after paper-run results showed the 93-95c band performing better)
 ENTRY_TIME_LEFT_MIN = 1.75     # earliest entry: minutes remaining in the 15m window
-ENTRY_TIME_LEFT_MAX = 4.5      # latest entry upper bound (was 4.5 -- see note below)
+ENTRY_TIME_LEFT_MAX = 5.0      # latest entry upper bound (was 4.5 -- see note below)
 # NOTE on the 4.5 -> 5.0 change: this came from an in-sample window search over the same
 # 3-month backtest period (candidates included 1.0-6.0, 1.5-5.0, 1.75-5.0, 2.0-5.0), and the
 # backtest report's own numbers don't fully reconcile -- one table reports 509 trades for the
@@ -219,9 +240,46 @@ def play_sound(event_type):
         "settle_win": [(2500, 200), (3000, 200)],
         "settle_loss": [(600, 500)],
         "stop": [(400, 1000)],
+        # Deliberately distinct and insistent -- this one means "act now, by hand".
+        "alert": [(2400, 150), (1800, 150), (2400, 150), (1800, 150), (2400, 300)],
     }
     for f, d in s.get(event_type, []):
         winsound.Beep(f, d)
+
+ALERTED_TICKERS = set()          # markets already alerted on -- one signal per market window
+ALERT_COOLDOWN_SECONDS = 20      # pause after alerting so the same setup doesn't re-fire immediately
+
+def emit_alert(market, side, price, dist_pct, time_left, qty, current_px, open_px):
+    """Signal-only output. Everything needed to place the trade by hand, in one block.
+
+    Prints the stop level up front because that is the number worth deciding BEFORE
+    entering, not after -- and because exit speed is the single biggest lever on
+    whether this strategy clears its own breakeven.
+    """
+    stop_cents = int(round(price * (1 - STOP_LOSS_THRESHOLD)))
+    max_loss = price / 100.0 * qty
+    win_amt = (100 - price) / 100.0 * qty
+    fee_est = taker_fee_dollars(price, qty)
+    seconds_left = time_left * 60.0
+
+    bar = "=" * 64
+    log("")
+    log(bar)
+    log(f"🔔 SIGNAL — BUY {side.upper()} @ {price}c   ({qty} contract{'s' if qty != 1 else ''})")
+    log(bar)
+    log(f"   Market      {market.ticker}")
+    log(f"   Time left   {time_left:.1f} min  (~{seconds_left:.0f}s to close)")
+    log(f"   BTC move    {dist_pct:+.3f}%   (open {open_px:,.2f} -> now {current_px:,.2f})")
+    log("")
+    log(f"   STOP AT     {stop_cents}c  ({side.upper()} bid) — set this BEFORE you enter")
+    log(f"   Risk        ${max_loss:.2f} max   |   Target +${win_amt:.2f}   |   Fee ~${fee_est:.2f}")
+    log("")
+    log(f"   ⏱ Act within a few seconds or SKIP — the filter measured this setup NOW,")
+    log(f"     and a late entry is a different trade than the one that qualified.")
+    log(bar)
+    log("")
+    if ALERT_SOUND:
+        play_sound("alert")
 
 # ====================== BTC PRICE HELPERS (for done-deal filters) ======================
 _last_klines_error_log_ts = 0.0
@@ -378,8 +436,39 @@ def place_order(ticker, side, count, action, price_cents=None):
     fill_price_cents is what the caller must use for PnL -- in pessimistic
     shadow mode it can differ from the requested price_cents.
     """
-    limit_cents = (min(99, price_cents + MAX_SLIPPAGE) if action == "buy"
-                   else max(1, price_cents - MAX_SLIPPAGE))
+    # Belt-and-braces: alert-only mode should never reach here (the caller branches
+    # to emit_alert first), but if any future code path calls place_order directly,
+    # refuse rather than quietly placing a real order in a signal-only session.
+    if ALERT_ONLY:
+        log(f"🛑 place_order blocked: --alert-only is set ({action} {count}x {ticker}). "
+            f"No order was sent.")
+        return 0, price_cents
+    # --- Limit pricing -------------------------------------------------------
+    # Kalshi has no market-order type: CreateOrderV2Request requires a price and every
+    # order is a limit. What the Kalshi UI calls a "market order" is just a limit priced
+    # aggressively enough to cross the book (your own manual fill showed "Limit 41c -
+    # Taker"). A marketable limit also gets PRICE IMPROVEMENT -- it executes against the
+    # best resting order, not at your limit. Observed live: limit 15c filled at 13c,
+    # limit 6c filled at 5c.
+    #
+    # So a wider limit does not mean paying more on a normal fill; it only means not
+    # MISSING one when the quote moves between reading the book and the order landing.
+    # The old ask+1c tolerance is what produced a ~1-in-8 entry fill rate.
+    #
+    # Entry cap is the strategy's own ceiling: we already accept anything up to
+    # MAX_ENTRY_THRESHOLD, so bidding that much can never overpay by definition.
+    # Exits go aggressive deliberately -- a stop fires when the book is running away,
+    # and filling at a poor bid beats not filling and riding to a full loss.
+    if action == "buy":
+        if AGGRESSIVE_ENTRY:
+            limit_cents = min(99, max(price_cents, MAX_ENTRY_THRESHOLD))
+        else:
+            limit_cents = min(99, price_cents + MAX_SLIPPAGE)
+    else:
+        if AGGRESSIVE_EXIT:
+            limit_cents = max(1, price_cents - EXIT_SLIPPAGE_CENTS)
+        else:
+            limit_cents = max(1, price_cents - MAX_SLIPPAGE)
 
     if SHADOW_MODE:
         fill_price = price_cents
@@ -597,7 +686,16 @@ def reconcile_state_with_positions(state):
 
 # ====================== MAIN LOOP ======================
 if __name__ == "__main__":
-    log(f"🪄 {BOT_NAME} Active ({ENTRY_THRESHOLD}-{MAX_ENTRY_THRESHOLD}c · {ENTRY_TIME_LEFT_MIN}-{ENTRY_TIME_LEFT_MAX}m left · 24/7 Done-Deal Filters)")
+    if ALERT_ONLY:
+        log("=" * 64)
+        log(f"🔔 {BOT_NAME} — ALERT-ONLY MODE")
+        log(f"   Filters: {ENTRY_THRESHOLD}-{MAX_ENTRY_THRESHOLD}c · "
+            f"{ENTRY_TIME_LEFT_MIN}-{ENTRY_TIME_LEFT_MAX}m left · 24/7 Done-Deal")
+        log("   NO ORDERS WILL BE PLACED. You execute manually on Kalshi.")
+        log("   Position monitoring and stop-loss are OFF -- you manage the exit.")
+        log("=" * 64)
+    else:
+        log(f"🪄 {BOT_NAME} Active ({ENTRY_THRESHOLD}-{MAX_ENTRY_THRESHOLD}c · {ENTRY_TIME_LEFT_MIN}-{ENTRY_TIME_LEFT_MAX}m left · 24/7 Done-Deal Filters)")
     if SHADOW_PESSIMISTIC and not SHADOW_MODE:
         log("❌ --shadow-pessimistic requires --shadow. Refusing to start so this isn't mistaken for a dry run.")
         raise SystemExit(2)
@@ -700,6 +798,15 @@ if __name__ == "__main__":
                 y_bid = n_bid = y_ask = n_ask = 0
 
             # --- MONITORING / STOP LOSS ---
+            if ALERT_ONLY and curr and curr.get("status") == "filled":
+                # Shouldn't happen (no orders are placed), but if a stale state.json from a
+                # live session is present, don't try to manage a position we never opened.
+                log("⚠️ Stale current_trade found in alert-only mode -- clearing. "
+                    "Manage any real position yourself on Kalshi.")
+                state["current_trade"] = None
+                save_state(state)
+                curr = None
+
             if curr and curr.get("status") == "filled":
                 m_live = client.get_market(curr['ticker']).market
                 live_bid = safe_price_cents(m_live.yes_bid_dollars if curr['side'] == "yes" else m_live.no_bid_dollars)
@@ -878,7 +985,9 @@ if __name__ == "__main__":
                 # so the same 93-97c band admits fewer signals than the bid version did.
                 y_qualifies = ENTRY_THRESHOLD <= y_ask <= MAX_ENTRY_THRESHOLD
                 n_qualifies = ENTRY_THRESHOLD <= n_ask <= MAX_ENTRY_THRESHOLD
-                if ENTRY_TIME_LEFT_MIN <= time_left <= ENTRY_TIME_LEFT_MAX and (y_qualifies or n_qualifies):
+                if (ALERT_ONLY and market.ticker in ALERTED_TICKERS):
+                    pass   # already alerted on this market window -- don't nag
+                elif ENTRY_TIME_LEFT_MIN <= time_left <= ENTRY_TIME_LEFT_MAX and (y_qualifies or n_qualifies):
                     # Prefer the higher of the two sides if both qualify
                     if y_qualifies and n_qualifies:
                         side, price = ("yes", y_ask) if y_ask >= n_ask else ("no", n_ask)
@@ -924,6 +1033,13 @@ if __name__ == "__main__":
                     if filters_ok:
                         qty = int(min(MAX_POSITION_DOLLARS, (cash * RISK_PCT)) * 100 // price)
                         if qty >= 1:
+                            if ALERT_ONLY:
+                                emit_alert(market, side, price, dist_pct, time_left, qty,
+                                           current_px, open_px)
+                                # Don't re-alert on the same market window. One signal per market.
+                                ALERTED_TICKERS.add(market.ticker)
+                                time.sleep(ALERT_COOLDOWN_SECONDS)
+                                continue
                             log(f"⚡ DONE-DEAL: {side.upper()} @ {price}c | dist={dist_pct:.3f}% | t={time_left:.1f}m (Qty: {qty})")
                             filled, fill_price = place_order(market.ticker, side, qty, "buy", price)
                             if filled > 0:
