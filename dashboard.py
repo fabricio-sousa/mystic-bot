@@ -35,6 +35,8 @@ to refresh.
 
 import os
 import json
+import math
+import argparse
 from datetime import datetime
 
 import pytz
@@ -62,7 +64,11 @@ STRIKE_LIMIT = 3
 LOG_TAIL_LINES = 80
 RECENT_TRADES_LIMIT = 30
 STALE_AFTER_SECONDS = 60   # heartbeat file untouched longer than this => bot considered offline
-PORT = 5000
+_argp = argparse.ArgumentParser()
+_argp.add_argument("--port", type=int, default=int(os.environ.get("PORT", 5000)),
+                    help="Port to serve on (default: 5000, or $PORT if set)")
+_args = _argp.parse_args()
+PORT = _args.port
 ET = pytz.timezone("US/Eastern")
 
 app = Flask(__name__)
@@ -162,6 +168,107 @@ def bot_is_online():
     except Exception:
         return False
 
+def _parse_ts(s):
+    """trades.json timestamps are 'YYYY-MM-DD HH:MM:SS' in ET, naive."""
+    try:
+        return ET.localize(datetime.strptime(str(s)[:19], "%Y-%m-%d %H:%M:%S"))
+    except Exception:
+        return None
+
+def wilson_interval(wins, n, z=1.96):
+    """95% confidence interval for a win rate. Wilson rather than normal-approx
+    because it stays sane at tiny n and at rates near 0 or 1 -- exactly this case."""
+    if n == 0:
+        return 0.0, 1.0
+    p = wins / n
+    denom = 1.0 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+def compute_projections(trades):
+    """Realized PnL over trailing windows, plus forward projections expressed as a
+    RANGE from the win-rate confidence interval -- not a point estimate.
+
+    A single projected number from a handful of trades reads as a forecast when it
+    is really noise. The interval makes the uncertainty visible: with very few
+    trades the lower bound sits deep in the red, which is the honest answer.
+    """
+    now = datetime.now(ET)
+    settled = []
+    for t in trades:
+        if t.get("type") not in ("SETTLEMENT", "STOP_LOSS"):
+            continue
+        ts = _parse_ts(t.get("timestamp"))
+        if ts is None:
+            continue
+        settled.append((ts, float(t.get("pnl") or 0.0), t))
+
+    out = {
+        "realized_7d": 0.0, "realized_30d": 0.0,
+        "proj_7d_low": None, "proj_7d_high": None,
+        "proj_30d_low": None, "proj_30d_high": None,
+        "settled": 0, "span_days": 0, "trades_per_day": 0.0,
+        "win_rate": None, "wr_low": None, "wr_high": None,
+        "avg_win": None, "avg_loss": None, "loss_is_theoretical": False,
+        "breakeven_wr": None,
+        "confidence": "none",
+    }
+    if not settled:
+        return out
+
+    settled.sort(key=lambda x: x[0])
+    out["realized_7d"] = round(sum(p for ts, p, _ in settled if (now - ts).days < 7), 2)
+    out["realized_30d"] = round(sum(p for ts, p, _ in settled if (now - ts).days < 30), 2)
+
+    n = len(settled)
+    out["settled"] = n
+    span = max(1.0, (settled[-1][0] - settled[0][0]).total_seconds() / 86400.0)
+    out["span_days"] = round(span, 1)
+    per_day = n / span
+    out["trades_per_day"] = round(per_day, 2)
+
+    wins = [p for _, p, _ in settled if p > 0]
+    losses = [-p for _, p, _ in settled if p < 0]
+    out["win_rate"] = round(len(wins) / n * 100.0, 1)
+    lo, hi = wilson_interval(len(wins), n)
+    out["wr_low"], out["wr_high"] = round(lo * 100, 1), round(hi * 100, 1)
+
+    avg_win = sum(wins) / len(wins) if wins else 0.0
+    if losses:
+        avg_loss = sum(losses) / len(losses)
+    else:
+        # No loss observed yet. Do NOT treat that as "losses cost nothing" -- derive the
+        # magnitude from what a losing trade would actually cost at the entry prices seen.
+        entries = [t.get("entry_price_cents") for _, _, t in settled if t.get("entry_price_cents")]
+        counts = [t.get("count") or 1 for _, _, t in settled]
+        avg_entry = (sum(entries) / len(entries)) if entries else 94.0
+        avg_count = (sum(counts) / len(counts)) if counts else 1
+        avg_loss = avg_entry / 100.0 * avg_count
+        out["loss_is_theoretical"] = True
+    out["avg_win"], out["avg_loss"] = round(avg_win, 3), round(avg_loss, 3)
+
+    # The decision-relevant number: what win rate does this win/loss ratio require just
+    # to break even? Compare it against the confidence interval above -- if the whole
+    # interval sits BELOW breakeven, the observed edge is negative at every plausible
+    # win rate, not merely unproven.
+    if (avg_win + avg_loss) > 0:
+        out["breakeven_wr"] = round(avg_loss / (avg_win + avg_loss) * 100.0, 1)
+    else:
+        out["breakeven_wr"] = None
+
+    # Expected PnL per trade at each end of the win-rate interval.
+    ev_low = lo * avg_win - (1 - lo) * avg_loss
+    ev_high = hi * avg_win - (1 - hi) * avg_loss
+    for days, key in ((7, "7d"), (30, "30d")):
+        out[f"proj_{key}_low"] = round(ev_low * per_day * days, 2)
+        out[f"proj_{key}_high"] = round(ev_high * per_day * days, 2)
+
+    out["confidence"] = ("insufficient" if n < 10 else
+                         "very low" if n < 30 else
+                         "low" if n < 100 else "moderate")
+    return out
+
 def compute_stats(trades):
     today_str = datetime.now(ET).strftime("%Y-%m-%d")
     today_pnl, all_pnl, wins, settled = 0.0, 0.0, 0, 0
@@ -188,17 +295,25 @@ def api_status():
     state = read_json_safe(STATE_FILE, {"strikes": 0, "current_trade": None})
     trades = read_json_safe(TRADES_FILE, [])
     trades_sorted = sorted(trades, key=lambda t: str(t.get("timestamp", "")), reverse=True)
+    scanner = read_json_safe(STATUS_FILE, None) or {}
 
     return jsonify({
         "bot_name": BOT_NAME,
         "online": bot_is_online(),
         "strikes": state.get("strikes", 0),
         "strike_limit": STRIKE_LIMIT,
+        "cash": scanner.get("cash"),
+        "peak_cash": scanner.get("peak_cash"),
+        "safety_floor": scanner.get("safety_floor"),
+        "daily_drawdown_pct": scanner.get("daily_drawdown_pct"),
+        "daily_drawdown_limit_pct": scanner.get("daily_drawdown_limit_pct"),
+        "is_daily_paused": scanner.get("is_daily_paused", False),
+        "projections": compute_projections(trades),
         "current_trade": state.get("current_trade"),
         "recent_trades": trades_sorted[:RECENT_TRADES_LIMIT],
         "stats": compute_stats(trades),
         "log_tail": tail_log(LOG_FILE),
-        "scanner": read_json_safe(STATUS_FILE, None),
+        "scanner": scanner or None,
         "server_time": datetime.now(ET).strftime("%H:%M:%S ET"),
     })
 
@@ -311,7 +426,7 @@ INDEX_HTML = """<!DOCTYPE html>
 
   .stats-row {
     display: grid;
-    grid-template-columns: repeat(5, 1fr);
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
     gap: 1px;
     background: var(--hairline);
     border: 1px solid var(--hairline);
@@ -365,6 +480,52 @@ INDEX_HTML = """<!DOCTYPE html>
     gap: 24px;
     align-items: start;
   }
+
+  .proj-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 18px;
+    padding: 16px 18px;
+  }
+
+  .proj-item .proj-label {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+    margin-bottom: 5px;
+  }
+
+  .proj-item .proj-value {
+    font-family: var(--mono);
+    font-size: 17px;
+    font-weight: 600;
+  }
+
+  .proj-value.proj-range { font-size: 13.5px; }
+
+  .proj-basis {
+    padding: 13px 18px 15px;
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 1.65;
+    color: var(--text-faint);
+    border-top: 1px solid var(--hairline);
+  }
+
+  .conf-badge {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 2px 7px;
+    border-radius: 3px;
+  }
+  .conf-badge.bad  { color: var(--negative); background: rgba(207,102,90,0.13);  border: 1px solid rgba(207,102,90,0.30); }
+  .conf-badge.warn { color: var(--accent);   background: rgba(227,163,62,0.13);  border: 1px solid rgba(227,163,62,0.30); }
+  .conf-badge.ok   { color: var(--positive); background: rgba(106,153,120,0.13); border: 1px solid rgba(106,153,120,0.30); }
 
   .panel {
     background: var(--panel);
@@ -521,7 +682,6 @@ INDEX_HTML = """<!DOCTYPE html>
 
   /* ---------- Responsive ---------- */
   @media (max-width: 880px) {
-    .stats-row { grid-template-columns: repeat(2, 1fr); }
     .columns { grid-template-columns: 1fr; }
     .position-grid { grid-template-columns: 1fr 1fr; }
   }
@@ -547,6 +707,14 @@ INDEX_HTML = """<!DOCTYPE html>
 
   <div class="stats-row">
     <div class="stat">
+      <div class="stat-label">Bankroll</div>
+      <div class="stat-value" id="cash">&mdash;</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Daily Drawdown</div>
+      <div class="stat-value" id="daily-dd">&mdash;</div>
+    </div>
+    <div class="stat">
       <div class="stat-label">Strikes</div>
       <div class="strikes-dots" id="strikes-dots"></div>
     </div>
@@ -566,6 +734,40 @@ INDEX_HTML = """<!DOCTYPE html>
       <div class="stat-label">Win Rate</div>
       <div class="stat-value" id="win-rate">&mdash;</div>
     </div>
+  </div>
+
+  <div class="panel" style="margin-bottom:24px;">
+    <div class="panel-header">
+      <span class="panel-title">Bankroll &amp; Projections</span>
+      <span id="conf-badge" class="conf-badge bad">NO DATA</span>
+    </div>
+    <div class="proj-grid">
+      <div class="proj-item">
+        <div class="proj-label">Peak / Floor</div>
+        <div class="proj-value" id="peak-floor">&mdash;</div>
+      </div>
+      <div class="proj-item">
+        <div class="proj-label">Realized 7d</div>
+        <div class="proj-value" id="real-7d">&mdash;</div>
+      </div>
+      <div class="proj-item">
+        <div class="proj-label">Realized 30d</div>
+        <div class="proj-value" id="real-30d">&mdash;</div>
+      </div>
+      <div class="proj-item">
+        <div class="proj-label">Breakeven Win Rate</div>
+        <div class="proj-value" id="breakeven">&mdash;</div>
+      </div>
+      <div class="proj-item">
+        <div class="proj-label">Projected 7d</div>
+        <div class="proj-value proj-range" id="proj-7d">&mdash;</div>
+      </div>
+      <div class="proj-item">
+        <div class="proj-label">Projected 30d</div>
+        <div class="proj-value proj-range" id="proj-30d">&mdash;</div>
+      </div>
+    </div>
+    <div class="proj-basis" id="proj-basis">Waiting for settled trades&hellip;</div>
   </div>
 
   <div class="panel" style="margin-bottom:24px;">
@@ -698,6 +900,87 @@ INDEX_HTML = """<!DOCTYPE html>
     `;
   }
 
+  const fmtCash = (v) => (v === null || v === undefined) ? "\u2014" : "$" + Number(v).toFixed(2);
+
+  function renderBankroll(data) {
+    document.getElementById("cash").textContent = fmtCash(data.cash);
+
+    const ddEl = document.getElementById("daily-dd");
+    if (data.daily_drawdown_pct === null || data.daily_drawdown_pct === undefined) {
+      ddEl.textContent = "\u2014"; ddEl.className = "stat-value";
+    } else {
+      // status.json reports drawdown as a POSITIVE number when down from today's open.
+      // Show it the way a trader reads it: negative = down = red.
+      const signed = -data.daily_drawdown_pct;
+      ddEl.textContent = signed.toFixed(1) + "%";
+      ddEl.className = "stat-value " + (signed < 0 ? "negative" : signed > 0 ? "positive" : "");
+    }
+
+    const pf = document.getElementById("peak-floor");
+    pf.textContent = (data.peak_cash != null)
+      ? fmtCash(data.peak_cash) + " / " + fmtCash(data.safety_floor)
+      : "\u2014";
+
+    const p = data.projections || {};
+    const r7 = document.getElementById("real-7d");
+    const r30 = document.getElementById("real-30d");
+    r7.textContent = fmtMoney(p.realized_7d || 0);
+    r7.className = "proj-value " + pnlClass(p.realized_7d || 0);
+    r30.textContent = fmtMoney(p.realized_30d || 0);
+    r30.className = "proj-value " + pnlClass(p.realized_30d || 0);
+
+    const rangeTxt = (lo, hi) => (lo === null || lo === undefined)
+      ? "\u2014"
+      : fmtMoney(lo) + "  to  " + fmtMoney(hi);
+    document.getElementById("proj-7d").textContent = rangeTxt(p.proj_7d_low, p.proj_7d_high);
+    document.getElementById("proj-30d").textContent = rangeTxt(p.proj_30d_low, p.proj_30d_high);
+
+    const beEl = document.getElementById("breakeven");
+    if (p.breakeven_wr == null) {
+      beEl.textContent = "\u2014"; beEl.className = "proj-value";
+    } else {
+      beEl.textContent = p.breakeven_wr.toFixed(1) + "%";
+      // Red when even the OPTIMISTIC end of the win-rate interval cannot reach breakeven;
+      // amber when breakeven falls inside the interval; green when clearly above it.
+      beEl.className = "proj-value " + ((p.wr_high < p.breakeven_wr) ? "negative"
+                        : (p.wr_low < p.breakeven_wr) ? "" : "positive");
+    }
+
+    const badge = document.getElementById("conf-badge");
+    const conf = p.confidence || "none";
+    badge.textContent = conf === "none" ? "NO DATA" : conf + " confidence";
+    badge.className = "conf-badge " + ((conf === "moderate") ? "ok"
+                        : (conf === "low") ? "warn" : "bad");
+
+    const basis = document.getElementById("proj-basis");
+    if (!p.settled) {
+      basis.textContent = "Waiting for settled trades\u2026";
+      return;
+    }
+    let txt = "Projection range spans the 95% confidence interval on win rate ("
+            + p.wr_low + "% \u2013 " + p.wr_high + "%, point estimate " + p.win_rate + "%), "
+            + "from " + p.settled + " settled trade" + (p.settled === 1 ? "" : "s")
+            + " over " + p.span_days + " day" + (p.span_days === 1 ? "" : "s")
+            + " at " + p.trades_per_day + " trades/day. "
+            + "Avg win $" + (p.avg_win || 0).toFixed(2) + ", avg loss $" + (p.avg_loss || 0).toFixed(2)
+            + ", so breakeven needs " + (p.breakeven_wr == null ? "?" : p.breakeven_wr.toFixed(1)) + "%.";
+    if (p.breakeven_wr != null && p.wr_high < p.breakeven_wr) {
+      txt += " NOTE: even the optimistic end of the win-rate interval ("
+           + p.wr_high + "%) is below breakeven, so on the trades recorded so far the "
+           + "edge is negative across the whole interval \u2014 not merely unproven.";
+    }
+    if (p.loss_is_theoretical) {
+      txt += " No loss observed yet \u2014 loss size is the theoretical full loss at the "
+           + "entry prices seen, not measured.";
+    }
+    if (p.settled < 30) {
+      txt += " At this sample size the interval is too wide to call the strategy "
+           + "profitable or unprofitable; assume it is noise until well past 30 trades. "
+           + "Both figures also assume the bot keeps running continuously at the same rate.";
+    }
+    basis.textContent = txt;
+  }
+
   function renderLog(lines) {
     const el = document.getElementById("log-body");
     const wasNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
@@ -798,6 +1081,7 @@ INDEX_HTML = """<!DOCTYPE html>
       document.getElementById("server-time").textContent = data.server_time;
 
       renderStrikes(data.strikes, data.strike_limit);
+      renderBankroll(data);
       document.getElementById("today-pnl").textContent = fmtMoney(data.stats.today_pnl);
       document.getElementById("today-pnl").className = "stat-value " + pnlClass(data.stats.today_pnl);
       document.getElementById("all-pnl").textContent = fmtMoney(data.stats.all_pnl);
