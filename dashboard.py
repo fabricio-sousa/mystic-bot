@@ -60,6 +60,10 @@ STATUS_FILE = os.path.join(BASE_DIR, "status.json")
 NGROK_TOKEN_FILE = os.path.join(BASE_DIR, "ngrok.txt")       # never logged, never committed -- treat like apikey.txt
 NGROK_AUTH_FILE = os.path.join(BASE_DIR, "ngrok_auth.txt")   # optional "username:password" for the tunnel's Basic Auth
 
+STARTING_BANKROLL = None   # Set a number (e.g. 140.00) to measure % return against a fixed
+                            # base. Left as None, the base is derived as
+                            # (current cash - cumulative realised PnL), which is correct until
+                            # you deposit or withdraw -- cash movements shift a derived base.
 STRIKE_LIMIT = 3
 LOG_TAIL_LINES = 80
 RECENT_TRADES_LIMIT = 30
@@ -186,7 +190,7 @@ def wilson_interval(wins, n, z=1.96):
     half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
     return max(0.0, centre - half), min(1.0, centre + half)
 
-def compute_projections(trades):
+def compute_projections(trades, cash=None):
     """Realized PnL over trailing windows, plus forward projections expressed as a
     RANGE from the win-rate confidence interval -- not a point estimate.
 
@@ -212,6 +216,9 @@ def compute_projections(trades):
         "win_rate": None, "wr_low": None, "wr_high": None,
         "avg_win": None, "avg_loss": None, "loss_is_theoretical": False,
         "breakeven_wr": None,
+        "total_pnl": 0.0, "total_pnl_pct": None,
+        "realized_7d_pct": None, "realized_30d_pct": None,
+        "start_bankroll": None,
         "confidence": "none",
     }
     if not settled:
@@ -220,6 +227,24 @@ def compute_projections(trades):
     settled.sort(key=lambda x: x[0])
     out["realized_7d"] = round(sum(p for ts, p, _ in settled if (now - ts).days < 7), 2)
     out["realized_30d"] = round(sum(p for ts, p, _ in settled if (now - ts).days < 30), 2)
+
+    # Percentage return needs a capital base. Prefer an explicit STARTING_BANKROLL if the
+    # operator set one; otherwise derive it as (current cash - cumulative realised PnL),
+    # i.e. the capital that must have been there before trading produced these results.
+    #
+    # Caveat worth knowing: the derived base moves with deposits and withdrawals. Pulling
+    # money out shifts it and therefore shifts the percentage, with no trade involved. Set
+    # STARTING_BANKROLL explicitly if you want a fixed benchmark across cash movements.
+    total_pnl = sum(p for _, p, _ in settled)
+    out["total_pnl"] = round(total_pnl, 2)
+    base = STARTING_BANKROLL
+    if base is None and cash is not None:
+        base = cash - total_pnl
+    if base and base > 0:
+        out["start_bankroll"] = round(base, 2)
+        out["total_pnl_pct"] = round(total_pnl / base * 100.0, 2)
+        out["realized_7d_pct"] = round(out["realized_7d"] / base * 100.0, 2)
+        out["realized_30d_pct"] = round(out["realized_30d"] / base * 100.0, 2)
 
     n = len(settled)
     out["settled"] = n
@@ -308,7 +333,7 @@ def api_status():
         "daily_drawdown_pct": scanner.get("daily_drawdown_pct"),
         "daily_drawdown_limit_pct": scanner.get("daily_drawdown_limit_pct"),
         "is_daily_paused": scanner.get("is_daily_paused", False),
-        "projections": compute_projections(trades),
+        "projections": compute_projections(trades, scanner.get("cash")),
         "current_trade": state.get("current_trade"),
         "recent_trades": trades_sorted[:RECENT_TRADES_LIMIT],
         "stats": compute_stats(trades),
@@ -504,15 +529,6 @@ INDEX_HTML = """<!DOCTYPE html>
   }
 
   .proj-value.proj-range { font-size: 13.5px; }
-
-  .proj-basis {
-    padding: 13px 18px 15px;
-    font-family: var(--mono);
-    font-size: 11px;
-    line-height: 1.65;
-    color: var(--text-faint);
-    border-top: 1px solid var(--hairline);
-  }
 
   .conf-badge {
     display: inline-block;
@@ -743,16 +759,20 @@ INDEX_HTML = """<!DOCTYPE html>
     </div>
     <div class="proj-grid">
       <div class="proj-item">
+        <div class="proj-label">Total P&amp;L</div>
+        <div class="proj-value proj-range" id="total-pnl">&mdash;</div>
+      </div>
+      <div class="proj-item">
         <div class="proj-label">Peak / Floor</div>
         <div class="proj-value" id="peak-floor">&mdash;</div>
       </div>
       <div class="proj-item">
         <div class="proj-label">Realized 7d</div>
-        <div class="proj-value" id="real-7d">&mdash;</div>
+        <div class="proj-value proj-range" id="real-7d">&mdash;</div>
       </div>
       <div class="proj-item">
         <div class="proj-label">Realized 30d</div>
-        <div class="proj-value" id="real-30d">&mdash;</div>
+        <div class="proj-value proj-range" id="real-30d">&mdash;</div>
       </div>
       <div class="proj-item">
         <div class="proj-label">Breakeven Win Rate</div>
@@ -767,7 +787,6 @@ INDEX_HTML = """<!DOCTYPE html>
         <div class="proj-value proj-range" id="proj-30d">&mdash;</div>
       </div>
     </div>
-    <div class="proj-basis" id="proj-basis">Waiting for settled trades&hellip;</div>
   </div>
 
   <div class="panel" style="margin-bottom:24px;">
@@ -922,12 +941,20 @@ INDEX_HTML = """<!DOCTYPE html>
       : "\u2014";
 
     const p = data.projections || {};
+    const withPct = (dollars, pct) =>
+      fmtMoney(dollars || 0) + (pct === null || pct === undefined
+        ? "" : "  (" + (pct >= 0 ? "+" : "") + pct.toFixed(2) + "%)");
+
+    const tp = document.getElementById("total-pnl");
+    tp.textContent = withPct(p.total_pnl, p.total_pnl_pct);
+    tp.className = "proj-value proj-range " + pnlClass(p.total_pnl || 0);
+
     const r7 = document.getElementById("real-7d");
     const r30 = document.getElementById("real-30d");
-    r7.textContent = fmtMoney(p.realized_7d || 0);
-    r7.className = "proj-value " + pnlClass(p.realized_7d || 0);
-    r30.textContent = fmtMoney(p.realized_30d || 0);
-    r30.className = "proj-value " + pnlClass(p.realized_30d || 0);
+    r7.textContent = withPct(p.realized_7d, p.realized_7d_pct);
+    r7.className = "proj-value proj-range " + pnlClass(p.realized_7d || 0);
+    r30.textContent = withPct(p.realized_30d, p.realized_30d_pct);
+    r30.className = "proj-value proj-range " + pnlClass(p.realized_30d || 0);
 
     const rangeTxt = (lo, hi) => (lo === null || lo === undefined)
       ? "\u2014"
@@ -952,33 +979,6 @@ INDEX_HTML = """<!DOCTYPE html>
     badge.className = "conf-badge " + ((conf === "moderate") ? "ok"
                         : (conf === "low") ? "warn" : "bad");
 
-    const basis = document.getElementById("proj-basis");
-    if (!p.settled) {
-      basis.textContent = "Waiting for settled trades\u2026";
-      return;
-    }
-    let txt = "Projection range spans the 95% confidence interval on win rate ("
-            + p.wr_low + "% \u2013 " + p.wr_high + "%, point estimate " + p.win_rate + "%), "
-            + "from " + p.settled + " settled trade" + (p.settled === 1 ? "" : "s")
-            + " over " + p.span_days + " day" + (p.span_days === 1 ? "" : "s")
-            + " at " + p.trades_per_day + " trades/day. "
-            + "Avg win $" + (p.avg_win || 0).toFixed(2) + ", avg loss $" + (p.avg_loss || 0).toFixed(2)
-            + ", so breakeven needs " + (p.breakeven_wr == null ? "?" : p.breakeven_wr.toFixed(1)) + "%.";
-    if (p.breakeven_wr != null && p.wr_high < p.breakeven_wr) {
-      txt += " NOTE: even the optimistic end of the win-rate interval ("
-           + p.wr_high + "%) is below breakeven, so on the trades recorded so far the "
-           + "edge is negative across the whole interval \u2014 not merely unproven.";
-    }
-    if (p.loss_is_theoretical) {
-      txt += " No loss observed yet \u2014 loss size is the theoretical full loss at the "
-           + "entry prices seen, not measured.";
-    }
-    if (p.settled < 30) {
-      txt += " At this sample size the interval is too wide to call the strategy "
-           + "profitable or unprofitable; assume it is noise until well past 30 trades. "
-           + "Both figures also assume the bot keeps running continuously at the same rate.";
-    }
-    basis.textContent = txt;
   }
 
   function renderLog(lines) {
