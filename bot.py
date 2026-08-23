@@ -94,10 +94,22 @@ EXIT_SLIPPAGE_CENTS = 4    # how far below the bid to place an exit.
                             # means occasional non-fills, which is the cheaper failure: riding
                             # to settlement costs the entry price, while a 58c sweep cost more
                             # than that on the losing contracts.
-EXIT_FLOOR_CENTS = 45      # never post an exit below this. Hard backstop against dumping into
-                            # a vacuum: below roughly half the entry the stop has already failed
-                            # at its job, and selling at 17c destroys more value than holding to
-                            # settlement. Set to 0 to disable the floor entirely.
+EXIT_FLOOR_CENTS = 0       # Refuse to exit at all when the bid is below this. 0 = disabled
+                            # (default): always exit fully, so losses are bounded by what the
+                            # book gives rather than by settlement.
+                            #
+                            # Set to a price (e.g. 45) to hold instead of selling into a
+                            # collapsed bid. Whichever you choose it now applies to EVERY
+                            # contract, including the first -- previously it only guarded
+                            # slices after the first, so a stop could sell one contract at 26c
+                            # and hold an identical one at 24c in the same second.
+                            #
+                            # Why the default flipped to off: the bid IS the market's
+                            # probability estimate, so selling and holding are close to
+                            # EV-equivalent. Selling costs the spread; holding takes full
+                            # variance. Live, the one contract that was held lost $0.96 while
+                            # its twin sold at 26c for $0.72. Bounded losses are easier to
+                            # size against, and loss magnitude is what drives breakeven.
 EXIT_SPLIT_ORDERS = True   # exit multi-contract positions one contract at a time, re-reading
                             # the book between each. Stops a single order walking the book, and
                             # lets the remainder abort if the bid has collapsed.
@@ -655,6 +667,10 @@ def _filled_qty_from_positions(ticker):
         log(f"⚠️ Could not read positions to verify fill on {ticker}: {e}")
         return None
 
+def _below_exit_floor(bid_cents):
+    """True when the bid has fallen through the configured floor (0 = no floor)."""
+    return EXIT_FLOOR_CENTS > 0 and 0 < bid_cents < EXIT_FLOOR_CENTS
+
 def exit_position(ticker, side, count, bid_cents):
     """Sell `count` contracts, one order at a time, re-reading the book between each.
 
@@ -665,7 +681,17 @@ def exit_position(ticker, side, count, bid_cents):
     what turned a 75c stop trigger into a ~17c fill on 3 contracts. Selling one at a time
     with a fresh quote between orders caps the damage at one contract's worth of slippage
     and lets us abort the remainder if the bid has collapsed.
+
+    The floor (when enabled) is checked before EVERY contract, so a position is either
+    exited or held as a whole. Checking it only from the second slice onward produced the
+    worst of both: one contract sold at 26c while an identical one was held at 24c, eating
+    the spread on one and full variance on the other.
     """
+    if _below_exit_floor(bid_cents):
+        log(f"🛑 Bid {bid_cents}c is below the {EXIT_FLOOR_CENTS}c exit floor — holding all "
+            f"{count} contract(s) on {ticker} to settlement rather than exiting part of it.")
+        return 0, bid_cents
+
     if count <= 1 or not EXIT_SPLIT_ORDERS:
         return place_order(ticker, side, count, "sell", bid_cents)
 
@@ -683,10 +709,10 @@ def exit_position(ticker, side, count, bid_cents):
                 log(f"⚠️ No bid left on {ticker} after {total_filled}/{count} sold — "
                     f"holding the remaining {count - total_filled} to settlement.")
                 break
-            if EXIT_FLOOR_CENTS > 0 and bid_cents < EXIT_FLOOR_CENTS:
-                log(f"🛑 Bid {bid_cents}c is below the {EXIT_FLOOR_CENTS}c exit floor after "
-                    f"{total_filled}/{count} sold — refusing to dump the remaining "
-                    f"{count - total_filled}. Holding to settlement caps the loss at entry.")
+            if _below_exit_floor(bid_cents):
+                log(f"🛑 Bid {bid_cents}c fell below the {EXIT_FLOOR_CENTS}c floor after "
+                    f"{total_filled}/{count} sold — holding the remaining "
+                    f"{count - total_filled} to settlement.")
                 break
 
         f, px = place_order(ticker, side, 1, "sell", bid_cents)
