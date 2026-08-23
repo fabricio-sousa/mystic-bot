@@ -82,11 +82,25 @@ AGGRESSIVE_ENTRY = True    # bid up to MAX_ENTRY_THRESHOLD instead of ask+MAX_SL
                             # Cannot overpay: MAX_ENTRY_THRESHOLD is already the top of the
                             # band we accept, and price improvement still fills us at the
                             # best ask (a 93c ask fills at 93c even with a 95c limit).
-AGGRESSIVE_EXIT = True     # price exits well through the bid so they actually cross.
-EXIT_SLIPPAGE_CENTS = 15   # how far below the bid to place an exit. Wide on purpose: the
-                            # bid is thin exactly when a stop fires, and price improvement
-                            # means we still receive the best available bid, not this price.
-                            # It is a floor on what we will accept, not what we expect.
+AGGRESSIVE_EXIT = True     # price exits through the bid so they actually cross.
+EXIT_SLIPPAGE_CENTS = 4    # how far below the bid to place an exit.
+                            # WAS 15, which caused book SWEEPS on multi-contract exits. Price
+                            # improvement only protects the FIRST contract: the order fills the
+                            # top bid, then walks DOWN through worse levels until filled. With
+                            # 1 contract that never showed. Live results as size grew:
+                            #     2 contracts, trigger 74c -> filled ~50c  (24c slippage)
+                            #     3 contracts, trigger 75c -> filled ~17c  (58c slippage)
+                            # Slippage roughly doubled when size went 2 -> 3. A tight band
+                            # means occasional non-fills, which is the cheaper failure: riding
+                            # to settlement costs the entry price, while a 58c sweep cost more
+                            # than that on the losing contracts.
+EXIT_FLOOR_CENTS = 45      # never post an exit below this. Hard backstop against dumping into
+                            # a vacuum: below roughly half the entry the stop has already failed
+                            # at its job, and selling at 17c destroys more value than holding to
+                            # settlement. Set to 0 to disable the floor entirely.
+EXIT_SPLIT_ORDERS = True   # exit multi-contract positions one contract at a time, re-reading
+                            # the book between each. Stops a single order walking the book, and
+                            # lets the remainder abort if the bid has collapsed.
 MAX_POSITION_DOLLARS = 500.0
 SAFETY_FLOOR_PCT = 0.75       # bot halts if cash drops to this fraction of the highest balance ever reached (trailing, not a fixed dollar amount)
 STRIKE_LIMIT = 3
@@ -467,6 +481,12 @@ def place_order(ticker, side, count, action, price_cents=None):
     else:
         if AGGRESSIVE_EXIT:
             limit_cents = max(1, price_cents - EXIT_SLIPPAGE_CENTS)
+            # Hard backstop: never offer below the floor. A limit at or under the floor
+            # would let the order sweep into a vacuum. If the bid has already fallen below
+            # the floor the stop has failed regardless, and holding to settlement caps the
+            # loss at the entry price instead of paying more on the way out.
+            if EXIT_FLOOR_CENTS > 0:
+                limit_cents = max(limit_cents, min(EXIT_FLOOR_CENTS, max(1, price_cents)))
         else:
             limit_cents = max(1, price_cents - MAX_SLIPPAGE)
 
@@ -634,6 +654,54 @@ def _filled_qty_from_positions(ticker):
     except Exception as e:
         log(f"⚠️ Could not read positions to verify fill on {ticker}: {e}")
         return None
+
+def exit_position(ticker, side, count, bid_cents):
+    """Sell `count` contracts, one order at a time, re-reading the book between each.
+
+    Returns (total_filled, weighted_avg_fill_cents).
+
+    A single multi-contract sell walks the book: price improvement only applies to the
+    first contract, then the order fills down through progressively worse levels. That is
+    what turned a 75c stop trigger into a ~17c fill on 3 contracts. Selling one at a time
+    with a fresh quote between orders caps the damage at one contract's worth of slippage
+    and lets us abort the remainder if the bid has collapsed.
+    """
+    if count <= 1 or not EXIT_SPLIT_ORDERS:
+        return place_order(ticker, side, count, "sell", bid_cents)
+
+    total_filled = 0
+    total_value = 0.0
+    for i in range(count):
+        if i > 0:
+            # Re-quote: the previous contract may have consumed the top of the book.
+            try:
+                m = client.get_market(ticker).market
+                bid_cents = bid_for_side(m, side)
+            except Exception as e:
+                log(f"⚠️ Exit re-quote failed on {ticker} ({e}); using last known bid {bid_cents}c.")
+            if bid_cents <= 0:
+                log(f"⚠️ No bid left on {ticker} after {total_filled}/{count} sold — "
+                    f"holding the remaining {count - total_filled} to settlement.")
+                break
+            if EXIT_FLOOR_CENTS > 0 and bid_cents < EXIT_FLOOR_CENTS:
+                log(f"🛑 Bid {bid_cents}c is below the {EXIT_FLOOR_CENTS}c exit floor after "
+                    f"{total_filled}/{count} sold — refusing to dump the remaining "
+                    f"{count - total_filled}. Holding to settlement caps the loss at entry.")
+                break
+
+        f, px = place_order(ticker, side, 1, "sell", bid_cents)
+        if f > 0:
+            total_filled += f
+            total_value += px * f
+        else:
+            log(f"⚠️ Exit slice {i+1}/{count} did not fill on {ticker}; will retry next loop.")
+            break
+
+    avg = int(round(total_value / total_filled)) if total_filled else bid_cents
+    if total_filled:
+        log(f"ℹ️ Exited {total_filled}/{count} on {ticker} at avg {avg}c "
+            f"({'split' if count > 1 else 'single'} orders).")
+    return total_filled, avg
 
 def reconcile_state_with_positions(state):
     try:
@@ -844,7 +912,7 @@ if __name__ == "__main__":
 
                 if curr.get('stop_breach_count', 0) >= STOP_CONFIRM_LOOPS:
                     log(f"🚨 STOP LOSS: Selling {curr['ticker']} (confirmed over {STOP_CONFIRM_LOOPS} consecutive polls)")
-                    filled, exit_price = place_order(curr['ticker'], curr['side'], curr['count'], "sell", live_bid)
+                    filled, exit_price = exit_position(curr['ticker'], curr['side'], curr['count'], live_bid)
                     if filled > 0:
                         # A stop pays the taker fee TWICE -- once entering, once exiting.
                         # Shadow already charged both at fill time, so live only.
