@@ -446,6 +446,55 @@ config.private_key_pem = private_key_pem
 client = KalshiClient(config)
 
 SELF_TRADE_PREVENTION_TYPE = "taker_at_cross"
+# --- Exchange sharding -----------------------------------------------------------------
+# Kalshi split trading across matching engines. Crypto events created from 2026-08-24
+# 12:00 ET live on shard 2; shard 0 is the catch-all for everything else.
+#
+# Two consequences, both load-bearing:
+#  1. Orders must be routed to the shard holding the market, else market_not_found.
+#  2. Collateral is checked INSIDE the matching engine, so funds must be preallocated on
+#     that shard. Ordering against an unfunded shard returns user_not_found even when the
+#     routing is correct -- that is what took the bot down on 2026-08-25.
+#
+# EXCHANGE_INDEX None = read the authoritative exchange_index off the market itself and
+# route explicitly, falling back to AUTO. Set an int to pin every order to one shard.
+EXCHANGE_INDEX = None
+EXCHANGE_INDEX_AUTO = -1   # -1 asks Kalshi to auto-route by ticker. Costs a little latency
+                            # (docs: "Automatic routing will incur an additional latency
+                            # cost") but always lands on the right engine.
+
+def market_exchange_index(market):
+    """Authoritative shard for a market. Ticker format says nothing about it.
+
+    Note: kalshi-python-sync 3.23.0 still documents this field as 'currently only 0
+    supported' -- that text predates the shard rollout. If the API omits it we fall back
+    to auto-routing rather than assuming shard 0, since assuming 0 is exactly what
+    produced market_not_found.
+    """
+    if EXCHANGE_INDEX is not None:
+        return EXCHANGE_INDEX
+    idx = getattr(market, "exchange_index", None)
+    return EXCHANGE_INDEX_AUTO if idx is None else int(idx)
+
+def shard_balance_dollars(exchange_index):
+    """Balance available ON A GIVEN SHARD, not the account total.
+
+    Collateral is per-shard, so sizing off the account total would size positions against
+    money the matching engine cannot see. Returns None if the breakdown is unavailable so
+    callers can decide rather than silently using the wrong number.
+    """
+    try:
+        resp = client.get_balance()
+        breakdown = getattr(resp, "balance_breakdown", None)
+        if breakdown:
+            for ib in breakdown:
+                if int(ib.exchange_index) == int(exchange_index):
+                    return float(ib.balance)
+            return 0.0   # breakdown present and this shard absent = genuinely unfunded
+        return None
+    except Exception as e:
+        log(f"⚠️ Could not read per-shard balance: {e}")
+        return None
 
 def _to_book_order(side, action, price_cents):
     if side == "yes":
@@ -456,7 +505,7 @@ def _to_book_order(side, action, price_cents):
         book_price_cents = 100 - price_cents
     return book_side, book_price_cents
 
-def place_order(ticker, side, count, action, price_cents=None):
+def place_order(ticker, side, count, action, price_cents=None, exchange_index=None):
     """Returns (filled_count, fill_price_cents).
 
     fill_price_cents is what the caller must use for PnL -- in pessimistic
@@ -555,6 +604,15 @@ def place_order(ticker, side, count, action, price_cents=None):
             price=f"{book_price_cents / 100:.2f}",
             time_in_force="good_till_canceled",
             self_trade_prevention_type=SELF_TRADE_PREVENTION_TYPE,
+            # Kalshi runs sharded exchanges. Omitting exchange_index defaults to shard 0,
+            # so if a market lives on another shard the order is rejected with
+            # market_not_found even though get_markets/get_market return it fine (market
+            # data is not sharded the same way). That is exactly what began happening at
+            # 01:41 ET on 2026-08-25 with no code change on our side: reads healthy,
+            # every create_order_v2 instantly market_not_found.
+            # -1 tells Kalshi to auto-route by market ticker, which is correct regardless
+            # of which shard the market is on.
+            exchange_index=(EXCHANGE_INDEX_AUTO if exchange_index is None else exchange_index),
         )
         exchange_order_id = resp.order_id
         filled = int(round(float(resp.fill_count)))
@@ -671,7 +729,7 @@ def _below_exit_floor(bid_cents):
     """True when the bid has fallen through the configured floor (0 = no floor)."""
     return EXIT_FLOOR_CENTS > 0 and 0 < bid_cents < EXIT_FLOOR_CENTS
 
-def exit_position(ticker, side, count, bid_cents):
+def exit_position(ticker, side, count, bid_cents, exchange_index=None):
     """Sell `count` contracts, one order at a time, re-reading the book between each.
 
     Returns (total_filled, weighted_avg_fill_cents).
@@ -693,7 +751,7 @@ def exit_position(ticker, side, count, bid_cents):
         return 0, bid_cents
 
     if count <= 1 or not EXIT_SPLIT_ORDERS:
-        return place_order(ticker, side, count, "sell", bid_cents)
+        return place_order(ticker, side, count, "sell", bid_cents, exchange_index=exchange_index)
 
     total_filled = 0
     total_value = 0.0
@@ -715,7 +773,7 @@ def exit_position(ticker, side, count, bid_cents):
                     f"{count - total_filled} to settlement.")
                 break
 
-        f, px = place_order(ticker, side, 1, "sell", bid_cents)
+        f, px = place_order(ticker, side, 1, "sell", bid_cents, exchange_index=exchange_index)
         if f > 0:
             total_filled += f
             total_value += px * f
@@ -963,7 +1021,8 @@ if __name__ == "__main__":
                                  f"waiting for confirmation" if drift is not None else "")
                     log(f"🚨 STOP LOSS: Selling {curr['ticker']} (confirmed over {STOP_CONFIRM_LOOPS} "
                         f"consecutive polls){drift_txt}")
-                    filled, exit_price = exit_position(curr['ticker'], curr['side'], curr['count'], live_bid)
+                    filled, exit_price = exit_position(curr['ticker'], curr['side'], curr['count'], live_bid,
+                                                       exchange_index=market_exchange_index(m_live))
                     if filled > 0:
                         # A stop pays the taker fee TWICE -- once entering, once exiting.
                         # Shadow already charged both at fill time, so live only.
@@ -1150,7 +1209,28 @@ if __name__ == "__main__":
                     }
 
                     if filters_ok:
-                        qty = int(min(MAX_POSITION_DOLLARS, (cash * RISK_PCT)) * 100 // price)
+                        # Collateral lives per shard. Size against what the matching engine
+                        # holding THIS market can actually see -- the account total may
+                        # include funds stranded on another shard, which would size a
+                        # position the engine will reject.
+                        sizing_cash = cash
+                        if not SHADOW_MODE:
+                            mkt_idx = market_exchange_index(market)
+                            if mkt_idx is not None and mkt_idx >= 0:
+                                shard_cash = shard_balance_dollars(mkt_idx)
+                                if shard_cash is not None:
+                                    if shard_cash <= 0:
+                                        log(f"🛑 No collateral on exchange shard {mkt_idx} "
+                                            f"(account total ${cash:.2f}). Kalshi checks "
+                                            f"collateral inside the matching engine, so orders "
+                                            f"here fail with user_not_found. Transfer funds to "
+                                            f"shard {mkt_idx} in the Kalshi UI. Skipping.")
+                                        continue
+                                    if abs(shard_cash - cash) > 0.01:
+                                        log(f"ℹ️ Sizing off shard {mkt_idx} balance "
+                                            f"${shard_cash:.2f} (account total ${cash:.2f}).")
+                                    sizing_cash = shard_cash
+                        qty = int(min(MAX_POSITION_DOLLARS, (sizing_cash * RISK_PCT)) * 100 // price)
                         if qty >= 1:
                             if ALERT_ONLY:
                                 emit_alert(market, side, price, dist_pct, time_left, qty,
@@ -1160,7 +1240,8 @@ if __name__ == "__main__":
                                 time.sleep(ALERT_COOLDOWN_SECONDS)
                                 continue
                             log(f"⚡ DONE-DEAL: {side.upper()} @ {price}c | dist={dist_pct:.3f}% | t={time_left:.1f}m (Qty: {qty})")
-                            filled, fill_price = place_order(market.ticker, side, qty, "buy", price)
+                            filled, fill_price = place_order(market.ticker, side, qty, "buy", price,
+                                                            exchange_index=market_exchange_index(market))
                             if filled > 0:
                                 if filled < qty:
                                     log(f"⚠️ Partial fill on entry: {filled}/{qty} contracts.")
