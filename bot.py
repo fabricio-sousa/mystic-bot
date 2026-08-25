@@ -928,16 +928,41 @@ if __name__ == "__main__":
                     # hold for STOP_CONFIRM_LOOPS consecutive loops (~STOP_CONFIRM_LOOPS
                     # seconds) before actually firing -- filters out single-poll flash spikes.
                     curr['stop_breach_count'] = curr.get('stop_breach_count', 0) + 1
+                    if curr['stop_breach_count'] == 1:
+                        # Record the bid at FIRST breach. Comparing it to the eventual exit
+                        # price is what the confirmation delay actually costs; comparing it
+                        # to a recovery is what the delay saves. Neither was measurable
+                        # before -- the log only ever recorded stops that fired.
+                        curr['first_breach_bid'] = live_bid
+                        curr['first_breach_ts'] = time.time()
+                        log(f"👁 BREACH 1/{STOP_CONFIRM_LOOPS} on {curr['ticker']}: bid {live_bid}c "
+                            f"<= stop {stop_p:.0f}c (entry {curr['entry_price_cents']}c). Confirming...")
                     state['current_trade'] = curr
                     save_state(state)
                 elif curr.get('stop_breach_count', 0):
+                    n_breach = curr['stop_breach_count']
+                    fb = curr.get('first_breach_bid')
+                    held = time.time() - curr.get('first_breach_ts', time.time())
+                    # This is a stop the confirmation filter PREVENTED. Log it explicitly so
+                    # the save-rate can be tallied against the slippage cost of waiting.
+                    log(f"✅ BREACH RECOVERED on {curr['ticker']} after {n_breach}/"
+                        f"{STOP_CONFIRM_LOOPS} poll(s), {held:.0f}s: bid "
+                        f"{fb}c -> {live_bid}c. Stop avoided by the confirmation filter.")
                     curr['stop_breach_count'] = 0
                     curr['stop_retry_count'] = 0   # price recovered; a later stop starts fresh
+                    curr['first_breach_bid'] = None
+                    curr['first_breach_ts'] = None
                     state['current_trade'] = curr
                     save_state(state)
 
                 if curr.get('stop_breach_count', 0) >= STOP_CONFIRM_LOOPS:
-                    log(f"🚨 STOP LOSS: Selling {curr['ticker']} (confirmed over {STOP_CONFIRM_LOOPS} consecutive polls)")
+                    fb = curr.get('first_breach_bid')
+                    waited = time.time() - curr.get('first_breach_ts', time.time())
+                    drift = (fb - live_bid) if fb is not None else None
+                    drift_txt = (f" | bid moved {fb}c -> {live_bid}c ({drift:+d}c) over {waited:.0f}s "
+                                 f"waiting for confirmation" if drift is not None else "")
+                    log(f"🚨 STOP LOSS: Selling {curr['ticker']} (confirmed over {STOP_CONFIRM_LOOPS} "
+                        f"consecutive polls){drift_txt}")
                     filled, exit_price = exit_position(curr['ticker'], curr['side'], curr['count'], live_bid)
                     if filled > 0:
                         # A stop pays the taker fee TWICE -- once entering, once exiting.
