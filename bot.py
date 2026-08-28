@@ -83,7 +83,18 @@ AGGRESSIVE_ENTRY = True    # bid up to MAX_ENTRY_THRESHOLD instead of ask+MAX_SL
                             # band we accept, and price improvement still fills us at the
                             # best ask (a 93c ask fills at 93c even with a 95c limit).
 AGGRESSIVE_EXIT = True     # price exits through the bid so they actually cross.
-EXIT_SLIPPAGE_CENTS = 4    # how far below the bid to place an exit.
+EXIT_SLIPPAGE_CENTS = 4    # how far below the bid to place the FIRST exit attempt.
+EXIT_SLIPPAGE_LADDER = [4, 10, 25]
+                            # Escalation when a slice does not fill. A tight 4c crosses fine
+                            # in a normal book and avoids sweeping, but in a fast collapse it
+                            # misses, and each miss costs a retry cycle while the bid keeps
+                            # falling. Live on 2026-08-26:
+                            #   19:00 mkt: slice missed at 4c -> 1/4 out at 48c, rest at 32c
+                            #   20:45 mkt: slice missed at 4c -> exited 39c from a 71c breach
+                            # Widening on the SAME slice instead of retrying at 4c keeps
+                            # normal exits tight (all the good stops filled first try at 4c)
+                            # while getting out fast when the book is running away.
+EXIT_ESCALATE_ON_MISS = True
                             # WAS 15, which caused book SWEEPS on multi-contract exits. Price
                             # improvement only protects the FIRST contract: the order fills the
                             # top bid, then walks DOWN through worse levels until filled. With
@@ -133,6 +144,63 @@ ENTRY_TIME_LEFT_MAX = 5.0      # latest entry upper bound (was 4.5 -- see note b
 # been checked against the raw trade-level data and/or validated out-of-sample (e.g. a stretch
 # of shadow-mode runtime that wasn't part of the backtest sample), not as a settled result.
 STOP_CONFIRM_LOOPS = 3        # consecutive loops (~1s each) the FULL stop condition must hold before it actually fires
+
+# --- Trading schedule ------------------------------------------------------------------
+# Per-weekday entry windows in ET, "HH:MM" 24h, start inclusive / end exclusive.
+# Set TRADING_SCHEDULE_ET = None to trade around the clock.
+#
+# Exits are NEVER gated by this: an open position is managed and stopped at any hour.
+# Gating an exit would strand a position exactly when it needs closing. Only NEW ENTRIES
+# are restricted.
+#
+# Background: across 151 live trades the 18:00-24:00 ET block was the only losing bucket
+# (18.4% loss rate, -$7.30) while 12:00-18:00 had zero losses, and all three stops that
+# gapped 10c+ past their trigger were in the evening. Thin post-close liquidity is the
+# likely mechanism. This schedule is a hypothesis from about a week of data, not a proven
+# edge -- judge it by whether losses stay away rather than reappearing inside the hours
+# that were kept.
+TRADING_SCHEDULE_ET = {
+    0: [("00:00", "05:00"), ("10:30", "16:00"), ("16:30", "17:30")],   # Monday
+    1: [("00:00", "05:00"), ("10:30", "16:00"), ("16:30", "17:30")],   # Tuesday
+    2: [("00:00", "05:00"), ("10:30", "16:00"), ("16:30", "17:30")],   # Wednesday
+    3: [("00:00", "05:00"), ("10:30", "16:00"), ("16:30", "17:30")],   # Thursday
+    4: [("00:00", "05:00"), ("10:30", "16:00"), ("16:30", "17:30")],   # Friday
+    5: [],                                                              # Saturday - closed
+    6: [("12:00", "17:00")],                                            # Sunday
+}
+
+_DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+def _hhmm_to_minutes(s):
+    h, m = s.split(":")
+    return int(h) * 60 + int(m)
+
+def within_trading_hours(now_et=None):
+    """True when NEW ENTRIES are allowed. Always True if TRADING_SCHEDULE_ET is None.
+
+    Windows are half-open [start, end): "10:30"-"16:00" admits 10:30:00 through
+    15:59:59. A window whose end is before its start wraps past midnight.
+    """
+    if not TRADING_SCHEDULE_ET:
+        return True
+    now = now_et or datetime.now(pytz.timezone("US/Eastern"))
+    mins = now.hour * 60 + now.minute
+    for start, end in TRADING_SCHEDULE_ET.get(now.weekday(), []):
+        s, e = _hhmm_to_minutes(start), _hhmm_to_minutes(end)
+        if (s <= mins < e) if s < e else (mins >= s or mins < e):
+            return True
+    return False
+
+def describe_schedule():
+    """One line per trading day, for the startup banner."""
+    if not TRADING_SCHEDULE_ET:
+        return ["24/7 - no schedule restriction"]
+    out = []
+    for d in range(7):
+        wins = TRADING_SCHEDULE_ET.get(d, [])
+        label = _DAY_NAMES[d][:3]
+        out.append(f"   {label}: " + (", ".join(f"{a}-{b}" for a, b in wins) if wins else "closed"))
+    return out
 HIGH_ENTRY_STOP_THRESHOLD = 97            # entries at/above this price get a widened % stop (see below)
 HIGH_ENTRY_STOP_LOSS_PCT = 0.375          # 35-40% stop for high-probability (>=97c) entries, vs. the normal 20%
 HIGH_ENTRY_STOP_FLOOR_CENTS = 67          # the widened stop never triggers above this hard cents floor (~65-70c)
@@ -505,7 +573,8 @@ def _to_book_order(side, action, price_cents):
         book_price_cents = 100 - price_cents
     return book_side, book_price_cents
 
-def place_order(ticker, side, count, action, price_cents=None, exchange_index=None):
+def place_order(ticker, side, count, action, price_cents=None, exchange_index=None,
+                exit_slippage=None):
     """Returns (filled_count, fill_price_cents).
 
     fill_price_cents is what the caller must use for PnL -- in pessimistic
@@ -541,7 +610,8 @@ def place_order(ticker, side, count, action, price_cents=None, exchange_index=No
             limit_cents = min(99, price_cents + MAX_SLIPPAGE)
     else:
         if AGGRESSIVE_EXIT:
-            limit_cents = max(1, price_cents - EXIT_SLIPPAGE_CENTS)
+            slip = EXIT_SLIPPAGE_CENTS if exit_slippage is None else exit_slippage
+            limit_cents = max(1, price_cents - slip)
             # Hard backstop: never offer below the floor. A limit at or under the floor
             # would let the order sweep into a vacuum. If the bid has already fallen below
             # the floor the stop has failed regardless, and holding to settlement caps the
@@ -773,12 +843,39 @@ def exit_position(ticker, side, count, bid_cents, exchange_index=None):
                     f"{count - total_filled} to settlement.")
                 break
 
-        f, px = place_order(ticker, side, 1, "sell", bid_cents, exchange_index=exchange_index)
+        # Escalate on the SAME slice rather than giving up and retrying at 4c next loop.
+        # A miss means the book moved past our limit; retrying at the same tightness just
+        # burns seconds while it keeps moving. Each rung re-quotes first, so we widen
+        # against the current book, not a stale one.
+        ladder = EXIT_SLIPPAGE_LADDER if EXIT_ESCALATE_ON_MISS else [EXIT_SLIPPAGE_CENTS]
+        f = 0
+        px = bid_cents
+        for rung, slip in enumerate(ladder):
+            if rung > 0:
+                try:
+                    m = client.get_market(ticker).market
+                    fresh = bid_for_side(m, side)
+                    if fresh > 0:
+                        bid_cents = fresh
+                except Exception:
+                    pass
+                if _below_exit_floor(bid_cents):
+                    log(f"🛑 Bid {bid_cents}c below the {EXIT_FLOOR_CENTS}c floor mid-escalation; "
+                        f"stopping with {total_filled}/{count} sold.")
+                    break
+                log(f"↩️ Slice {i+1}/{count} missed at {ladder[rung-1]}c slippage; "
+                    f"widening to {slip}c against bid {bid_cents}c.")
+            f, px = place_order(ticker, side, 1, "sell", bid_cents,
+                                exchange_index=exchange_index, exit_slippage=slip)
+            if f > 0:
+                break
+
         if f > 0:
             total_filled += f
             total_value += px * f
         else:
-            log(f"⚠️ Exit slice {i+1}/{count} did not fill on {ticker}; will retry next loop.")
+            log(f"⚠️ Exit slice {i+1}/{count} did not fill on {ticker} even at "
+                f"{ladder[-1]}c slippage; will retry next loop.")
             break
 
     avg = int(round(total_value / total_filled)) if total_filled else bid_cents
@@ -847,7 +944,15 @@ if __name__ == "__main__":
         log("   Position monitoring and stop-loss are OFF -- you manage the exit.")
         log("=" * 64)
     else:
-        log(f"🪄 {BOT_NAME} Active ({ENTRY_THRESHOLD}-{MAX_ENTRY_THRESHOLD}c · {ENTRY_TIME_LEFT_MIN}-{ENTRY_TIME_LEFT_MAX}m left · 24/7 Done-Deal Filters)")
+        _hrs = "24/7" if not TRADING_SCHEDULE_ET else "scheduled"
+        log(f"🪄 {BOT_NAME} Active ({ENTRY_THRESHOLD}-{MAX_ENTRY_THRESHOLD}c · "
+            f"{ENTRY_TIME_LEFT_MIN}-{ENTRY_TIME_LEFT_MAX}m left · {_hrs} · Done-Deal Filters)")
+        if TRADING_SCHEDULE_ET:
+            log("   ⏰ Entry schedule (ET):")
+            for _line in describe_schedule():
+                log(_line)
+            log(f"   Currently {'OPEN' if within_trading_hours() else 'CLOSED'} for new entries. "
+                f"Open positions are managed and stopped at any hour.")
     if SHADOW_PESSIMISTIC and not SHADOW_MODE:
         log("❌ --shadow-pessimistic requires --shadow. Refusing to start so this isn't mistaken for a dry run.")
         raise SystemExit(2)
@@ -863,6 +968,7 @@ if __name__ == "__main__":
 
     _last_skip_log = {"key": None, "ts": 0.0}
     _last_heartbeat_print_ts = 0.0
+    _last_schedule_open = None   # log only when the schedule flips open/closed
 
     while True:
         try:
@@ -876,6 +982,13 @@ if __name__ == "__main__":
                     OVERRIDE_TRIGGERED = True
 
             now_et = datetime.now(pytz.timezone("US/Eastern"))
+            if TRADING_SCHEDULE_ET:
+                _open_now = within_trading_hours(now_et)
+                if _open_now != _last_schedule_open:
+                    log("⏰ Entry window OPEN." if _open_now else
+                        "⏰ Entry window CLOSED - no new entries until the next window. "
+                        "Any open position is still managed.")
+                    _last_schedule_open = _open_now
             state = load_state()
             cash = state.get("shadow_cash", _args.shadow_cash) if SHADOW_MODE else client.get_balance().balance / 100.0
             if SHADOW_MODE and "shadow_cash" not in state:
@@ -1165,7 +1278,8 @@ if __name__ == "__main__":
                 n_qualifies = ENTRY_THRESHOLD <= n_ask <= MAX_ENTRY_THRESHOLD
                 if (ALERT_ONLY and market.ticker in ALERTED_TICKERS):
                     pass   # already alerted on this market window -- don't nag
-                elif ENTRY_TIME_LEFT_MIN <= time_left <= ENTRY_TIME_LEFT_MAX and (y_qualifies or n_qualifies):
+                elif (ENTRY_TIME_LEFT_MIN <= time_left <= ENTRY_TIME_LEFT_MAX
+                      and (y_qualifies or n_qualifies) and within_trading_hours()):
                     # Prefer the higher of the two sides if both qualify
                     if y_qualifies and n_qualifies:
                         side, price = ("yes", y_ask) if y_ask >= n_ask else ("no", n_ask)
