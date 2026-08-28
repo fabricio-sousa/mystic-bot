@@ -160,11 +160,11 @@ STOP_CONFIRM_LOOPS = 3        # consecutive loops (~1s each) the FULL stop condi
 # edge -- judge it by whether losses stay away rather than reappearing inside the hours
 # that were kept.
 TRADING_SCHEDULE_ET = {
-    0: [("10:30", "16:00"), ("16:30", "17:30")],   # Monday
-    1: [("10:30", "16:00"), ("16:30", "17:30")],   # Tuesday
-    2: [("10:30", "16:00"), ("16:30", "17:30")],   # Wednesday
-    3: [("10:30", "16:00"), ("16:30", "17:30")],   # Thursday
-    4: [("10:30", "16:00"), ("16:30", "17:30")],   # Friday
+    0: [("00:00", "05:00"),("10:30", "16:00"), ("16:30", "17:30")],   # Monday
+    1: [("00:00", "05:00"),("10:30", "16:00"), ("16:30", "17:30")],   # Tuesday
+    2: [("00:00", "05:00"),("10:30", "16:00"), ("16:30", "17:30")],   # Wednesday
+    3: [("00:00", "05:00"),("10:30", "16:00"), ("16:30", "17:30")],   # Thursday
+    4: [("00:00", "05:00"),("10:30", "16:00"), ("16:30", "17:30")],   # Friday
     5: [],                                          # Saturday - closed all day
     6: [("12:00", "17:00")],                        # Sunday
 }
