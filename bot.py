@@ -60,7 +60,7 @@ def taker_fee_dollars(price_cents, count):
 shadow_taker_fee_dollars = taker_fee_dollars
 
 # ====================== CONFIG ======================
-BOT_NAME = "Mystic-Bot 1.0 24/7" + (" [SHADOW]" if SHADOW_MODE else "")
+BOT_NAME = "Mystic-Bot 1.0" + (" [SHADOW]" if SHADOW_MODE else "")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _prefix = "shadow_" if SHADOW_MODE else ""
@@ -122,14 +122,14 @@ EXIT_FLOOR_CENTS = 0       # Refuse to exit at all when the bid is below this. 0
                             # its twin sold at 26c for $0.72. Bounded losses are easier to
                             # size against, and loss magnitude is what drives breakeven.
 EXIT_SPLIT_ORDERS = True   # exit multi-contract positions one contract at a time, re-reading
-                            # the book between each. Stops a single order walking the book, and
+                            #* the book between each. Stops a single order walking the book, and
                             # lets the remainder abort if the bid has collapsed.
 MAX_POSITION_DOLLARS = 500.0
-SAFETY_FLOOR_PCT = 0.75       # bot halts if cash drops to this fraction of the highest balance ever reached (trailing, not a fixed dollar amount)
+SAFETY_FLOOR_PCT = 0.70       # bot halts if cash drops to this fraction of the highest balance ever reached (trailing, not a fixed dollar amount)
 STRIKE_LIMIT = 3
 STOP_LOSS_THRESHOLD = 0.20
 ENTRY_THRESHOLD = 93          # minimum yes_bid/no_bid cents to consider (was exact == 93)
-RISK_PCT = 0.01               # flat risk per trade
+RISK_PCT = 0.05               # flat risk per trade
 ORDER_POLL_SECONDS = 3        # how many 1s polls to wait for a fill before canceling the rest
 WICK_MIN_PCT = 0.00015        # min rejection-wick size as a % of BTC price (~$15 at $100k BTC)
 MAX_ENTRY_THRESHOLD = 95      # never take a fresh entry priced above this -- 96-99c entries are intentionally excluded
@@ -166,7 +166,7 @@ TRADING_SCHEDULE_ET = {
     3: [("00:00", "05:00"),("10:30", "16:00"), ("16:30", "17:30")],   # Thursday
     4: [("00:00", "05:00"),("10:30", "16:00"), ("16:30", "17:30")],   # Friday
     5: [],                                          # Saturday - closed all day
-    6: [("12:00", "17:00")],                        # Sunday
+    6: [("07:00", "17:00")],                        # Sunday
 }
 
 _DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
@@ -740,9 +740,27 @@ def place_order(ticker, side, count, action, price_cents=None, exchange_index=No
                     f"is tracked and stop-loss/settlement still run. CHECK KALSHI MANUALLY.")
                 filled = count
             elif action == "buy":
-                # Entering from flat: the position we now hold IS what filled.
-                filled = min(count, verified)
-                log(f"ℹ️ Positions report {verified} contract(s) on {ticker}; booking {filled}.")
+                # Entering from flat -- USUALLY. If verified > count, positions shows MORE
+                # contracts than this specific order could have produced, which means either
+                # a partial fill combined with resting size we're not accounting for, or --
+                # as happened on 2026-09-24 -- a PRIOR order on this same ticker filled but
+                # was incorrectly booked as a zero fill (its own fallback raced a stale
+                # positions read), leaving a real position with no record of it. Silently
+                # capping at min(count, verified) hides exactly that case: it would have
+                # booked 6 here while 7 pre-existing, unrelated contracts sat untracked and
+                # unprotected. Book the FULL verified amount instead -- overcounting what's
+                # actually at risk fails safe (a later sell attempts more than truly needed
+                # and is simply rejected or partially filled); undercounting it is what left
+                # 7 contracts to ride to a full, unrecorded loss.
+                filled = verified
+                if verified > count:
+                    log(f"🚨 Positions on {ticker} show {verified} contract(s), more than "
+                        f"this order's own size ({count}). Booking the FULL {verified} as "
+                        f"the position -- there may be an untracked fill from a prior order "
+                        f"on this ticker. This is the exact anomaly behind the 2026-09-24 "
+                        f"loss; treat it as needing a manual check of Kalshi's order history.")
+                else:
+                    log(f"ℹ️ Positions report {verified} contract(s) on {ticker}; booking {filled}.")
             else:
                 # Exiting: positions reports what REMAINS, not what sold. We came in holding
                 # `count`, so the fill is count - remaining. Reading `verified` directly here
@@ -1353,12 +1371,44 @@ if __name__ == "__main__":
                                 ALERTED_TICKERS.add(market.ticker)
                                 time.sleep(ALERT_COOLDOWN_SECONDS)
                                 continue
+
+                            # Pre-entry safety check: confirm we do not already hold a live
+                            # position on this exact ticker, regardless of what current_trade
+                            # says. This is the guard that would have stopped the 2026-09-24
+                            # 12:41 incident. Entry #1 filled 7 contracts, but a stale positions
+                            # read right after a cancel-404 made the fallback book it as a ZERO
+                            # fill, so current_trade stayed empty. 21 seconds later a fresh
+                            # signal on the SAME ticker passed every filter with nothing to stop
+                            # it, and entry #2 fired for 6 more. The stop-loss then only ever
+                            # knew about entry #2's 6 contracts -- entry #1's 7 rode to
+                            # settlement completely unmanaged, a loss that never appeared in
+                            # trades.json. current_trade being empty is necessary but not
+                            # sufficient evidence that no position exists; ask the exchange too.
+                            if not SHADOW_MODE:
+                                existing = _filled_qty_from_positions(market.ticker)
+                                if existing:
+                                    log(f"🚨 REFUSING entry on {market.ticker}: positions show "
+                                        f"{existing} contract(s) already held here, but no trade "
+                                        f"is tracked in state.json. This is the exact mismatch "
+                                        f"that caused the 2026-09-24 loss -- NOT placing a new "
+                                        f"order on top of an untracked position. Check Kalshi's "
+                                        f"order history for {market.ticker} and either close the "
+                                        f"existing position by hand or restart the bot so "
+                                        f"reconcile_state_with_positions can adopt it.")
+                                    continue
+
                             log(f"⚡ DONE-DEAL: {side.upper()} @ {price}c | dist={dist_pct:.3f}% | t={time_left:.1f}m (Qty: {qty})")
                             filled, fill_price = place_order(market.ticker, side, qty, "buy", price,
                                                             exchange_index=market_exchange_index(market))
                             if filled > 0:
                                 if filled < qty:
                                     log(f"⚠️ Partial fill on entry: {filled}/{qty} contracts.")
+                                elif filled > qty:
+                                    log(f"⚠️ Entry booked MORE than requested: {filled} vs "
+                                        f"{qty} asked for. This means place_order's fallback "
+                                        f"found extra contracts already on this ticker -- see "
+                                        f"the warning above. Verify against Kalshi's order "
+                                        f"history when convenient.")
                                 state["current_trade"] = {
                                     "ticker": market.ticker,
                                     "side": side,
