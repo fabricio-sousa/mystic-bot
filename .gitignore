@@ -21,3 +21,5 @@ analyze_stops.py
 analyze_stops.py
 status.json.tmp
 manual.py
+move_to_shard.py
+setup_subaccount.py
